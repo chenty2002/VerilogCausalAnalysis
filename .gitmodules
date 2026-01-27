@@ -1,0 +1,3 @@
+[submodule "hdlConvertor"]
+	path = hdlConvertor
+	url = https://github.com/Nic30/hdlConvertor.git
