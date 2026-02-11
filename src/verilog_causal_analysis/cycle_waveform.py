@@ -3,12 +3,17 @@ Cycle-aligned Waveform Parser for Causal Graph Construction.
 
 Parses FST waveform files and aligns signal values to clock cycles.
 Provides discrete value(signal, cycle) table for causal analysis.
+
+Key Features:
+- Clock edge detection for cycle boundary identification
+- Efficient signal value caching with O(1) lookup after first access
+- Binary search for time-to-cycle conversion
 """
 
 import os
+from bisect import bisect_right
 from dataclasses import dataclass, field
-from typing import Dict, List, Set, Tuple, Optional, Any, Iterator
-from enum import Enum
+from typing import Dict, List, Tuple, Optional, Any
 import pylibfst
 
 
@@ -125,41 +130,14 @@ class CycleAlignedWaveform:
         return self._cycle_count
     
     def time_to_cycle(self, time: int) -> int:
-        """
-        Convert simulation time to cycle number.
-        
-        Args:
-            time: Simulation time
-            
-        Returns:
-            Cycle number (0-indexed)
-        """
+        """Convert simulation time to cycle number (0-indexed)."""
         if not self._cycle_boundaries:
             return 0
-        
-        # Binary search for the cycle
-        left, right = 0, len(self._cycle_boundaries) - 1
-        while left <= right:
-            mid = (left + right) // 2
-            if self._cycle_boundaries[mid] <= time:
-                if mid == len(self._cycle_boundaries) - 1 or self._cycle_boundaries[mid + 1] > time:
-                    return mid
-                left = mid + 1
-            else:
-                right = mid - 1
-        
-        return 0
+        idx = bisect_right(self._cycle_boundaries, time) - 1
+        return max(0, idx)
     
     def cycle_to_time(self, cycle: int) -> int:
-        """
-        Get the start time of a cycle.
-        
-        Args:
-            cycle: Cycle number (0-indexed)
-            
-        Returns:
-            Simulation time of cycle start (rising edge)
-        """
+        """Get the start time of a cycle (rising edge time)."""
         if cycle < 0:
             return self.start_time
         if cycle >= self._cycle_count:
@@ -167,15 +145,7 @@ class CycleAlignedWaveform:
         return self._cycle_boundaries[cycle]
     
     def get_cycle_time_range(self, cycle: int) -> Tuple[int, int]:
-        """
-        Get the time range for a cycle.
-        
-        Args:
-            cycle: Cycle number
-            
-        Returns:
-            (start_time, end_time) tuple
-        """
+        """Get (start_time, end_time) for a cycle."""
         start = self.cycle_to_time(cycle)
         if cycle + 1 < self._cycle_count:
             end = self._cycle_boundaries[cycle + 1] - 1
@@ -449,15 +419,7 @@ class CycleAlignedWaveform:
 
 
 def parse_binary_value(value: str) -> Optional[int]:
-    """
-    Parse a binary value string to integer.
-    
-    Args:
-        value: Binary value string (e.g., "1010", "x", "z")
-        
-    Returns:
-        Integer value, or None if contains x/z
-    """
+    """Parse binary string to int; returns None if contains x/z."""
     if not value or 'x' in value.lower() or 'z' in value.lower():
         return None
     try:
@@ -467,40 +429,15 @@ def parse_binary_value(value: str) -> Optional[int]:
 
 
 def invert_value(value: str) -> str:
-    """
-    Invert a binary value (for counterfactual analysis).
-    
-    Args:
-        value: Binary value string
-        
-    Returns:
-        Inverted value
-    """
+    """Bitwise invert binary value (preserves x/z)."""
     if not value:
         return value
-    
-    result = []
-    for c in value:
-        if c == '0':
-            result.append('1')
-        elif c == '1':
-            result.append('0')
-        else:
-            result.append(c)  # Keep x/z as is
-    return ''.join(result)
+
+    return value.translate(str.maketrans('01', '10'))
 
 
 def values_differ(val1: str, val2: str) -> bool:
-    """
-    Check if two values differ (ignoring x/z).
-    
-    Args:
-        val1: First value
-        val2: Second value
-        
-    Returns:
-        True if values definitely differ
-    """
+    """Check if two binary values differ (ignoring x/z bits)."""
     if not val1 or not val2:
         return False
     

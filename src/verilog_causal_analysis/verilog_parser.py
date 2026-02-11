@@ -30,8 +30,8 @@ from hdlConvertorAst.hdlAst import (
 
 class DependencyType(Enum):
     """Type of dependency between signals."""
-    COMBINATIONAL = "combinational"  # Same cycle dependency
-    SEQUENTIAL = "sequential"        # Previous cycle dependency (register)
+    COMBINATIONAL = "combinational"  # Same cycle (assign, always @(*))
+    SEQUENTIAL = "sequential"        # Previous cycle (always @(posedge clk))
     STATE = "state"                  # State machine transition
     PORT_INPUT = "port_input"        # Module input port
     PORT_OUTPUT = "port_output"      # Module output port
@@ -42,7 +42,7 @@ class DependencyType(Enum):
 
 @dataclass
 class SignalInfo:
-    """Information about a signal in the design."""
+    """Signal metadata in the design."""
     name: str
     signal_type: str  # wire, reg, logic, input, output
     width: int = 1
@@ -51,24 +51,24 @@ class SignalInfo:
     defined_in_file: str = ""
     defined_at_line: int = 0
     module_name: str = ""
-    
+
     def __hash__(self):
         return hash((self.name, self.module_name))
 
 
 @dataclass
 class Dependency:
-    """Represents a dependency between two signals."""
-    source: str           # Source signal name
-    target: str           # Target signal name
+    """Dependency relationship between two signals."""
+    source: str
+    target: str
     dep_type: DependencyType
-    expression: str = ""   # The RTL expression
+    expression: str = ""
     file_path: str = ""
     line_start: int = 0
     line_end: int = 0
     code_snippet: str = ""
-    condition: str = ""    # Condition under which dependency applies
-    
+    condition: str = ""
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "source": self.source,
@@ -84,7 +84,7 @@ class Dependency:
 
 @dataclass
 class ModuleInfo:
-    """Information about a Verilog module."""
+    """Verilog module information."""
     name: str
     file_path: str
     line_start: int
@@ -95,18 +95,45 @@ class ModuleInfo:
     submodule_instances: List[Tuple[str, str, int]] = field(default_factory=list)
 
 
+# Operator mapping for expression-to-string conversion
+_OP_MAP = {
+    HdlOpType.AND: '&', HdlOpType.OR: '|', HdlOpType.XOR: '^',
+    HdlOpType.AND_LOG: '&&', HdlOpType.OR_LOG: '||',
+    HdlOpType.EQ: '==', HdlOpType.NE: '!=',
+    HdlOpType.LT: '<', HdlOpType.GT: '>', HdlOpType.LE: '<=', HdlOpType.GE: '>=',
+    HdlOpType.ADD: '+', HdlOpType.SUB: '-', HdlOpType.MUL: '*', HdlOpType.DIV: '/',
+    HdlOpType.NEG: '~', HdlOpType.NEG_LOG: '!', HdlOpType.MINUS_UNARY: '-',
+    HdlOpType.AND_UNARY: '&', HdlOpType.OR_UNARY: '|', HdlOpType.XOR_UNARY: '^',
+    HdlOpType.NAND_UNARY: '~&', HdlOpType.NOR_UNARY: '~|', HdlOpType.XNOR_UNARY: '~^',
+    HdlOpType.TERNARY: '?:', HdlOpType.INDEX: '[]',
+    HdlOpType.CONCAT: '{}', HdlOpType.SLL: '<<', HdlOpType.SRL: '>>',
+    HdlOpType.SLA: '<<<', HdlOpType.SRA: '>>>',
+}
+
+_UNARY_OPS = {
+    HdlOpType.NEG, HdlOpType.NEG_LOG, HdlOpType.MINUS_UNARY,
+    HdlOpType.AND_UNARY, HdlOpType.OR_UNARY, HdlOpType.XOR_UNARY,
+    HdlOpType.NAND_UNARY, HdlOpType.NOR_UNARY, HdlOpType.XNOR_UNARY
+}
+
+# Keywords to exclude from SVA signal matching
+_SVA_KEYWORDS = frozenset({
+    'assert', 'property', 'disable', 'iff', 'posedge', 'negedge',
+    'if', 'else', 'always', 'assign', 'begin', 'end', 'wire', 'reg',
+    'logic', 'input', 'output', 'inout', 'module', 'endmodule',
+    'integer', 'parameter', 'localparam', 'genvar', 'for', 'while',
+    'case', 'endcase', 'default', 'initial', 'final', 'always_comb',
+    'always_ff', 'always_latch', 'unique', 'priority', 'h', 'b', 'd', 'o'
+})
+
+
 class VerilogParser:
-    """
-    Verilog/SystemVerilog parser using hdlConvertor.
+    """Verilog/SystemVerilog parser using hdlConvertor.
     
-    Extracts:
-    - Module definitions and ports
-    - Signal declarations (wire/reg/logic)
-    - Combinational dependencies (assign, always @(*))
-    - Sequential dependencies (always @(posedge clk))
-    - Module instantiations
+    Extracts module definitions, signal declarations, dependencies,
+    and module instantiations for causal graph construction.
     """
-    
+
     def __init__(self):
         self.converter = HdlConvertor()
         self.modules: Dict[str, ModuleInfo] = {}
@@ -114,15 +141,12 @@ class VerilogParser:
         self.all_dependencies: List[Dependency] = []
         self.file_contents: Dict[str, str] = {}
         self.file_lines: Dict[str, List[str]] = {}
-        
-        # Regex patterns for SVA assertion parsing (hdlConvertor may skip these)
-        # Matches: assertion_label: assert property (@(posedge clock) ...) content;
+        # SVA assertion pattern (fallback when hdlConvertor skips)
         self._re_assert_label = re.compile(
             r'^\s*(\w+)\s*:\s*assert\s+property\s*\(@\([^)]+\)\s*'
             r'(?:disable\s+iff\s*\([^)]+\)\s*)?(.+?)\)',
             re.MULTILINE | re.DOTALL
         )
-        # Matches signal identifiers in expressions
         self._re_signal_ref = re.compile(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\b')
 
     def _looks_like_file_ref(self, line: str) -> bool:
@@ -257,59 +281,20 @@ class VerilogParser:
                 return f"{node.bits}'h{node.val}"
             return str(node.val)
         if isinstance(node, HdlOp):
-            op_map = {
-                HdlOpType.AND: '&', HdlOpType.OR: '|', HdlOpType.XOR: '^',
-                HdlOpType.AND_LOG: '&&', HdlOpType.OR_LOG: '||',
-                HdlOpType.EQ: '==', HdlOpType.NE: '!=',
-                HdlOpType.LT: '<', HdlOpType.GT: '>',
-                HdlOpType.LE: '<=', HdlOpType.GE: '>=',
-                HdlOpType.ADD: '+', HdlOpType.SUB: '-',
-                HdlOpType.MUL: '*', HdlOpType.DIV: '/',
-                HdlOpType.NEG: '~', HdlOpType.NEG_LOG: '!',
-                HdlOpType.MINUS_UNARY: '-',
-                HdlOpType.AND_UNARY: '&', HdlOpType.OR_UNARY: '|',
-                HdlOpType.XOR_UNARY: '^', HdlOpType.NAND_UNARY: '~&',
-                HdlOpType.TERNARY: '?:',
-                HdlOpType.INDEX: '[]',
-                HdlOpType.CONCAT: '{}',
-                HdlOpType.SLL: '<<', HdlOpType.SRL: '>>',
-                HdlOpType.SLA: '<<<', HdlOpType.SRA: '>>>',
-            }
+            fn_name = _OP_MAP.get(node.fn, str(node.fn).split('.')[-1])
+            ops = node.ops
             
-            fn_name = op_map.get(node.fn, str(node.fn).split('.')[-1])
-            
-            if node.fn == HdlOpType.TERNARY and len(node.ops) >= 3:
-                cond = self._expr_to_string(node.ops[0], depth + 1)
-                then_e = self._expr_to_string(node.ops[1], depth + 1)
-                else_e = self._expr_to_string(node.ops[2], depth + 1)
-                return f"({cond} ? {then_e} : {else_e})"
-            
-            if node.fn == HdlOpType.INDEX and len(node.ops) >= 2:
-                base = self._expr_to_string(node.ops[0], depth + 1)
-                idx = self._expr_to_string(node.ops[1], depth + 1)
-                return f"{base}[{idx}]"
-            
-            # Handle concatenation specially (Verilog {a, b, c} syntax)
+            if node.fn == HdlOpType.TERNARY and len(ops) >= 3:
+                return f"({self._expr_to_string(ops[0], depth+1)} ? {self._expr_to_string(ops[1], depth+1)} : {self._expr_to_string(ops[2], depth+1)})"
+            if node.fn == HdlOpType.INDEX and len(ops) >= 2:
+                return f"{self._expr_to_string(ops[0], depth+1)}[{self._expr_to_string(ops[1], depth+1)}]"
             if node.fn == HdlOpType.CONCAT:
-                ops_str = ', '.join(self._expr_to_string(op, depth + 1) for op in node.ops)
-                return f"{{{ops_str}}}"
-            
-            # Unary operators
-            unary_ops = {HdlOpType.NEG, HdlOpType.NEG_LOG, HdlOpType.MINUS_UNARY,
-                         HdlOpType.AND_UNARY, HdlOpType.OR_UNARY, HdlOpType.XOR_UNARY,
-                         HdlOpType.NAND_UNARY, HdlOpType.NOR_UNARY, HdlOpType.XNOR_UNARY}
-            if node.fn in unary_ops and node.ops:
-                operand = self._expr_to_string(node.ops[0], depth + 1)
-                return f"{fn_name}{operand}"
-            
-            if len(node.ops) == 2:
-                left = self._expr_to_string(node.ops[0], depth + 1)
-                right = self._expr_to_string(node.ops[1], depth + 1)
-                return f"({left} {fn_name} {right})"
-            
-            ops_str = ', '.join(self._expr_to_string(op, depth + 1) for op in node.ops)
-            return f"{fn_name}({ops_str})"
-        
+                return "{" + ", ".join(self._expr_to_string(op, depth+1) for op in ops) + "}"
+            if node.fn in _UNARY_OPS and ops:
+                return f"{fn_name}{self._expr_to_string(ops[0], depth+1)}"
+            if len(ops) == 2:
+                return f"({self._expr_to_string(ops[0], depth+1)} {fn_name} {self._expr_to_string(ops[1], depth+1)})"
+            return f"{fn_name}({', '.join(self._expr_to_string(op, depth+1) for op in ops)})"
         return str(type(node).__name__)
     
     def _is_sequential_process(self, process: HdlStmProcess) -> bool:
@@ -582,8 +567,8 @@ class VerilogParser:
                     
                     elif isinstance(body_obj, HdlCompInst):
                         # Module instantiation
-                        inst_name = str(body_obj.name.val) if hasattr(body_obj.name, 'val') else str(body_obj.name)
-                        mod_name = str(body_obj.module_name.val) if hasattr(body_obj.module_name, 'val') else str(body_obj.module_name)
+                        inst_name = str(getattr(body_obj.name, 'val', body_obj.name))
+                        mod_name = str(getattr(body_obj.module_name, 'val', body_obj.module_name))
                         inst_line, _ = self._get_position(body_obj)
                         module.submodule_instances.append((inst_name, mod_name, inst_line))
                         
@@ -649,17 +634,6 @@ class VerilogParser:
             return
         
         content = self.file_contents[file_path]
-        lines = self.file_lines[file_path]
-        
-        # Keywords to exclude from signal matching
-        keywords = {
-            'assert', 'property', 'disable', 'iff', 'posedge', 'negedge',
-            'if', 'else', 'always', 'assign', 'begin', 'end', 'wire', 'reg',
-            'logic', 'input', 'output', 'inout', 'module', 'endmodule',
-            'integer', 'parameter', 'localparam', 'genvar', 'for', 'while',
-            'case', 'endcase', 'default', 'initial', 'final', 'always_comb',
-            'always_ff', 'always_latch', 'unique', 'priority', 'h', 'b', 'd', 'o'
-        }
         
         # Find assertion blocks: "label: assert property (...)"
         # Pattern: look for labeled assertions
@@ -680,19 +654,18 @@ class VerilogParser:
             start_pos = match.start()
             line_num = content[:start_pos].count('\n') + 1
             
+            # Signals to ignore (assertion-helper signals for reset)
+            _ignored_sva_signals = {'hasBeenReset', 'hasBeenResetReg', 'reset'}
+            
             # Extract signal references from property body
             all_signals = set()
             for sig_match in self._re_signal_ref.finditer(property_body):
                 sig = sig_match.group(1)
-                if sig.lower() not in keywords and not sig.isdigit():
+                if sig.lower() not in _SVA_KEYWORDS and not sig.isdigit() and sig not in _ignored_sva_signals:
                     all_signals.add(sig)
             
-            # Also extract from disable condition
-            if disable_cond:
-                for sig_match in self._re_signal_ref.finditer(disable_cond):
-                    sig = sig_match.group(1)
-                    if sig.lower() not in keywords and not sig.isdigit():
-                        all_signals.add(sig)
+            # Skip disable condition signals (they are typically reset-related
+            # and not causal to the assertion failure)
             
             # Find which module this assertion belongs to
             target_module = None
@@ -763,8 +736,8 @@ class VerilogParser:
         return sources
     
     def build_dependency_graph(self) -> Dict[str, List[Tuple[str, DependencyType, Dependency]]]:
-        """Build complete dependency graph."""
-        graph = {}
+        """Build complete target -> [(source, type, dep)] graph."""
+        graph: Dict[str, List[Tuple[str, DependencyType, Dependency]]] = {}
         for dep in self.all_dependencies:
             if dep.target not in graph:
                 graph[dep.target] = []
