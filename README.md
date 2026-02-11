@@ -57,3 +57,94 @@ cd VerilogCausalAnalysis
 ```bash
 bash init.sh
 ```
+
+## 快速开始
+
+### 命令行使用
+
+使用 `analyze.py` 命令行工具进行因果分析：
+
+```bash
+# 完全自动检测模式（推荐）
+# - 从 FST 文件名解析断言信号名
+# - 从波形分析断言触发的周期
+# - 从波形顶层模块自动查找 clock/clk 信号
+python analyze.py \
+    --fst tests/philo4.System_should_not_deadlock_when_all_philosophers_are_hungry.fst \
+    --verilog tests/TestTop.sv \
+    --output output/philo4
+
+# 手动指定时钟信号（其他参数自动检测）
+python analyze.py \
+    --fst tests/philo4.System_should_not_deadlock_when_all_philosophers_are_hungry.fst \
+    --verilog tests/TestTop.sv \
+    --clock philo4.clock \
+    --output output/philo4
+
+# 完全手动指定所有参数
+python analyze.py \
+    --fst tests/philo4.System_should_not_deadlock_when_all_philosophers_are_hungry.fst \
+    --verilog tests/TestTop.sv \
+    --clock philo4.clock \
+    --endpoint "philo4.System_should_not_deadlock_when_all_philosophers_are_hungry" \
+    --cycle 298 \
+    --output output/philo4
+
+# 列出可用的断言信号（从 Verilog 源码提取 SVA）
+python analyze.py \
+    --fst tests/philo4.System_should_not_deadlock_when_all_philosophers_are_hungry.fst \
+    --verilog tests/TestTop.sv \
+    --list-signals
+```
+
+### 命令行参数
+
+| 参数 | 缩写 | 必需 | 说明 |
+|------|------|------|------|
+| `--fst` | `-f` | ✓ | FST 波形文件路径 |
+| `--verilog` | `-v` | ✓ | Verilog/SV 源文件（可多个） |
+| `--clock` | `-c` | | 时钟信号名称（不指定则自动检测） |
+| `--output` | `-o` | ✓ | 输出目录 |
+| `--endpoint` | `-e` | | 端点信号名（不指定则从文件名解析） |
+| `--cycle` | `-n` | | 端点周期（不指定则从波形检测断言触发时刻） |
+| `--max-depth` | `-d` | | 最大追溯深度（默认: 20） |
+| `--max-nodes` | `-m` | | 最大节点数（默认: 200） |
+| `--format` | | | 图像格式: png/svg/pdf（默认: png） |
+| `--dpi` | | | 图像分辨率（默认: 300） |
+| `--list-signals` | | | 列出可用断言信号后退出 |
+| `--quiet` | `-q` | | 静默模式 |
+
+
+### Python API 使用
+
+```python
+from verilog_causal_analysis import CausalGraphBuilder
+
+# 创建构建器
+builder = CausalGraphBuilder(
+    fst_path="counterexample.fst",
+    verilog_paths=["design.v", "testbench.v"],
+    clock_signal="clk"
+)
+
+# 构建因果图
+result = builder.build(
+    endpoint_signal="assertion_fail",
+    endpoint_cycle=100
+)
+
+# 导出结果
+builder.export_json("output/causal_graph.json")
+builder.export_graph("output/causal_graph.png")  # 直接生成图像
+builder.export_dot("output/causal_graph.dot")
+
+# 获取摘要
+print(builder.get_natural_language_summary())
+
+# 关闭资源
+builder.close()
+```
+
+
+
+tests目录下有若干子目录，每个子目录包括了一个benchmark（Chisel代码+Verilog代码+所有触发断言的波形图+对其中某一个反例分析生成的波形图），使用因果图分析，对所有benchmark进行因果图生成测试：每个benchmark仅需任选一个波形图，生成结果到results目录下对应目录；之后，对照dot格式因果图与verilog/chisel代码，检查因果图分析是否有任何形式的错误
