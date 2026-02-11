@@ -62,6 +62,15 @@ from .causal_slicer import (
     ExpressionEvaluator
 )
 
+from .auto_detect import (
+    build,
+    extract_assertion_from_filename,
+    detect_assertion_trigger_cycle,
+    detect_clock_signal,
+    extract_sva_assertions_from_verilog,
+    get_assertion_signals_from_waveform
+)
+
 __all__ = [
     # Main API
     'CausalGraphBuilder',
@@ -90,6 +99,14 @@ __all__ = [
     'CausalEdge',
     'ContributionType',
     'ExpressionEvaluator',
+    
+    # Auto-detection
+    'build',
+    'extract_assertion_from_filename',
+    'detect_assertion_trigger_cycle',
+    'detect_clock_signal',
+    'extract_sva_assertions_from_verilog',
+    'get_assertion_signals_from_waveform',
     
     # Version
     '__version__'
