@@ -90,7 +90,6 @@ venv.bak/
 
 # Output files
 output/
-*.fst
 *.vcd
 
 # Logs
