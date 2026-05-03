@@ -490,16 +490,33 @@ class BackwardSlicer:
             return '.'.join(parts[:-1])
         return ''
 
-    def _get_signal_sources_cached(self, signal_name: str) -> List[str]:
-        """Get cached source signals for a target signal name."""
-        if signal_name in self._signal_sources_cache:
-            return self._signal_sources_cache[signal_name]
+    def _infer_module_name(self, signal: str, hierarchy: str = '') -> Optional[str]:
+        """Infer RTL module name for a waveform signal when parser supports it."""
+        infer = getattr(self.parser, "infer_module_from_signal", None)
+        if callable(infer):
+            return infer(signal, hierarchy=hierarchy)
+        return None
 
-        sources = self.dep_graph.get(signal_name)
+    def _get_signal_sources_cached(self, signal_name: str, module_name: Optional[str] = None) -> List[str]:
+        """Get cached source signals for a target signal name."""
+        cache_key = f"{module_name or ''}:{signal_name}"
+        if cache_key in self._signal_sources_cache:
+            return self._signal_sources_cache[cache_key]
+
+        graph_key = f"{module_name}.{signal_name}" if module_name else signal_name
+        sources = self.dep_graph.get(graph_key)
         if sources is None:
-            source_list = [s for s, _ in self.parser.get_signal_sources(signal_name)]
+            sources = self.dep_graph.get(signal_name)
+        if sources is None:
+            source_list = [s for s, _ in self.parser.get_signal_sources(signal_name, module_name)]
         else:
-            source_list = [s for s, _, _ in sources]
+            if module_name:
+                source_list = [
+                    s for s, _, dep in sources
+                    if not getattr(dep, "module_name", None) or dep.module_name == module_name
+                ]
+            else:
+                source_list = [s for s, _, _ in sources]
 
         # De-duplicate while preserving order
         seen: Set[str] = set()
@@ -509,7 +526,7 @@ class BackwardSlicer:
                 seen.add(src)
                 deduped.append(src)
 
-        self._signal_sources_cache[signal_name] = deduped
+        self._signal_sources_cache[cache_key] = deduped
         return deduped
 
     def _resolve_signal_value(self,
@@ -642,8 +659,9 @@ class BackwardSlicer:
         """
         base_signal = self._extract_base_signal_name(endpoint_signal)
         hierarchy = self._extract_module_hierarchy(endpoint_signal)
+        module_hint = self._infer_module_name(endpoint_signal, hierarchy)
         
-        deps = self.parser.get_dependencies_for_signal(base_signal)
+        deps = self.parser.get_dependencies_for_signal(base_signal, module_hint)
         if not deps:
             return None
         
@@ -754,11 +772,13 @@ class BackwardSlicer:
         
         # Get RTL context using base signal name (without hierarchy prefix)
         base_signal = self._extract_base_signal_name(signal)
-        rtl_context = self.parser.get_rtl_context(base_signal)
+        signal_hierarchy = self._extract_module_hierarchy(signal)
+        module_hint = self._infer_module_name(signal, signal_hierarchy or parent_hierarchy)
+        rtl_context = self.parser.get_rtl_context(base_signal, module_hint)
         
         # If not found, try with original signal name
         if not rtl_context.get("found", False):
-            rtl_context = self.parser.get_rtl_context(original_signal)
+            rtl_context = self.parser.get_rtl_context(original_signal, module_hint)
         
         node = CausalNode(
             id=node_id,
@@ -789,10 +809,14 @@ class BackwardSlicer:
         Returns:
             Source signal's relevant cycle
         """
-        if dep.dep_type == DependencyType.COMBINATIONAL:
+        if dep.dep_type in (
+            DependencyType.COMBINATIONAL,
+            DependencyType.ASSERTION,
+            DependencyType.PORT_INPUT,
+            DependencyType.PORT_OUTPUT,
+            DependencyType.WIRE,
+        ):
             return target_cycle  # Same cycle for combinational
-        elif dep.dep_type == DependencyType.ASSERTION:
-            return target_cycle  # Assertions are combinational - same cycle
         elif dep.dep_type == DependencyType.SEQUENTIAL:
             return max(0, target_cycle - 1)  # Previous cycle for sequential
         else:
@@ -828,10 +852,11 @@ class BackwardSlicer:
         target_base = self._extract_base_signal_name(target_signal)
         target_hierarchy = self._extract_module_hierarchy(target_signal)
         source_base = self._extract_base_signal_name(source_signal)
+        module_hint = self._infer_module_name(target_signal, target_hierarchy)
 
         env: Dict[str, str] = {}
         match_cache: Dict[str, List[str]] = {}
-        for src in self._get_signal_sources_cached(target_base):
+        for src in self._get_signal_sources_cached(target_base, module_hint):
             val, _ = self._resolve_signal_value(
                 src, source_cycle, target_hierarchy, match_cache, prefer_hierarchy=True
             )
@@ -1038,14 +1063,15 @@ class BackwardSlicer:
         # Extract base signal name and hierarchy for lookup
         base_signal = self._extract_base_signal_name(node.signal)
         parent_hierarchy = self._extract_module_hierarchy(node.signal)
+        module_hint = self._infer_module_name(node.signal, parent_hierarchy)
         
         # Get dependencies from RTL
-        deps = self.parser.get_dependencies_for_signal(base_signal)
+        deps = self.parser.get_dependencies_for_signal(base_signal, module_hint)
         
         if not deps:
             # Check if we can find with the full name (no width annotation)
             clean_signal = re.sub(r'\s*\[\d+:\d+\]$', '', node.signal)
-            deps = self.parser.get_dependencies_for_signal(clean_signal)
+            deps = self.parser.get_dependencies_for_signal(clean_signal, module_hint)
         
         if not deps:
             # No RTL dependencies found, mark as potential root

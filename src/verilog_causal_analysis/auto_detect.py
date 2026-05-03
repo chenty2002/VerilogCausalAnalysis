@@ -196,9 +196,11 @@ def extract_sva_assertions_from_verilog(verilog_paths: List[str]) -> List[str]:
             ["my_assertion"]
     """
     # SVA assertion pattern: label: assert property
-    # Matches: label: assert property (@(...) ...)
+    # Matches same-line and split-line Chisel/firtool output:
+    #   label:
+    #     assert property (@(...) ...)
     assertion_pattern = re.compile(
-        r'^\s*(\w+)\s*:\s*assert\s+property',
+        r'^\s*([a-zA-Z_$][a-zA-Z0-9_$]*)\s*:\s*(?:\n\s*)?assert\s+property\b',
         re.MULTILINE
     )
     
