@@ -360,9 +360,10 @@ class VerilogParser:
     def _is_output_direction(direction: Optional[str]) -> bool:
         return direction in {"out", "output"}
 
-    def _extract_signals_from_text(self, text: str) -> Set[str]:
+    def _extract_signals_from_text(self, text: str) -> List[str]:
         """Extract likely signal references from a Verilog/SVA expression string."""
-        signals: Set[str] = set()
+        signals: List[str] = []
+        seen: Set[str] = set()
         if not text:
             return signals
         text = re.sub(r'//.*', '', text)
@@ -377,7 +378,10 @@ class VerilogParser:
                 continue
             if re.fullmatch(r'[bhdoxzBHDOXZ][0-9a-fA-F_xXzZ]*', sig):
                 continue
-            signals.add(sig)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            signals.append(sig)
         return signals
     
     def _extract_signals_from_expr(self, node, signals: Optional[Set[str]] = None) -> Set[str]:
@@ -957,10 +961,10 @@ class VerilogParser:
             _ignored_sva_signals = {'hasBeenReset', 'hasBeenResetReg', 'reset'}
             
             # Extract signal references from property body
-            all_signals = {
+            all_signals = [
                 sig for sig in self._extract_signals_from_text(property_body)
                 if self._base_signal_name(sig) not in _ignored_sva_signals
-            }
+            ]
             
             # Skip disable condition signals (they are typically reset-related
             # and not causal to the assertion failure)

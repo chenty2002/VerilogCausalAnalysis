@@ -132,6 +132,90 @@ endmodule
     print("✓ SVA label auto-detection tests passed")
 
 
+def test_sva_signal_extraction_preserves_source_order():
+    """Test SVA dependency extraction keeps operand order stable."""
+    from verilog_causal_analysis import VerilogParser
+
+    parser = VerilogParser()
+
+    signals = parser._extract_signals_from_text('~_controllerA_io_ack | _clientA_io_req')
+
+    assert signals == ['_controllerA_io_ack', '_clientA_io_req']
+
+
+def test_endpoint_direct_dependencies_are_preserved_before_recursion():
+    """Test endpoint parents are not lost when the first branch exhausts max_nodes."""
+    from verilog_causal_analysis import BackwardSlicer, Dependency, DependencyType
+
+    class FakeParser:
+        def build_dependency_graph(self):
+            return {}
+
+        def infer_module_from_signal(self, signal_name, hierarchy=''):
+            return 'Top'
+
+        def get_dependencies_for_signal(self, signal_name, module_name=None):
+            if signal_name == 'fail':
+                return [
+                    Dependency(
+                        source='req',
+                        target='fail',
+                        dep_type=DependencyType.ASSERTION,
+                        expression='~ack | req',
+                    ),
+                    Dependency(
+                        source='ack',
+                        target='fail',
+                        dep_type=DependencyType.ASSERTION,
+                        expression='~ack | req',
+                    ),
+                ]
+            if signal_name == 'req':
+                return [
+                    Dependency(
+                        source='deep',
+                        target='req',
+                        dep_type=DependencyType.COMBINATIONAL,
+                        expression='deep',
+                    )
+                ]
+            return []
+
+        def get_signal_sources(self, signal_name, module_name=None):
+            return [(dep.source, dep.dep_type) for dep in self.get_dependencies_for_signal(signal_name, module_name)]
+
+        def get_rtl_context(self, signal_name, module_name=None):
+            return {'found': True, 'rtl_refs': []}
+
+    class FakeWaveform:
+        def __init__(self):
+            self.values = {
+                ('Top.fail', 1): '0',
+                ('Top.req', 1): '0',
+                ('Top.ack', 1): '1',
+                ('Top.deep', 1): '0',
+            }
+
+        def get_signal_value(self, signal, cycle):
+            return self.values.get((signal, cycle))
+
+        def find_signal(self, signal, max_results=10):
+            return [f'Top.{signal}']
+
+    slicer = BackwardSlicer(FakeParser(), FakeWaveform(), max_depth=20, max_nodes=3)
+
+    nodes, edges = slicer.slice_from_endpoint('Top.fail', 1)
+
+    node_by_id = {node.id: node for node in nodes.values()}
+    endpoint_edges = [
+        edge for edge in edges
+        if node_by_id[edge.dst_node_id].signal == 'Top.fail'
+    ]
+    endpoint_sources = {node_by_id[edge.src_node_id].signal for edge in endpoint_edges}
+
+    assert endpoint_sources == {'Top.req', 'Top.ack'}
+
+
 def test_expression_evaluator():
     """Test ExpressionEvaluator."""
     from verilog_causal_analysis import ExpressionEvaluator

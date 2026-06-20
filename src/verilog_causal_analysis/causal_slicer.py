@@ -1077,7 +1077,9 @@ class BackwardSlicer:
             # No RTL dependencies found, mark as potential root
             node.is_root = True
             return
-        
+
+        parents_to_recurse: List[Tuple[CausalNode, int]] = []
+
         for dep in deps:
             # Determine parent cycle
             parent_cycle = self._get_parent_cycle(dep, node.cycle)
@@ -1202,8 +1204,10 @@ class BackwardSlicer:
             # Update parent node suspect score
             parent_node.suspect_score = max(parent_node.suspect_score, score * 0.9)
             
-            # Recurse
-            self._slice_node(parent_node, depth + 1)
+            parents_to_recurse.append((parent_node, depth + 1))
+
+        for parent_node, parent_depth in parents_to_recurse:
+            self._slice_node(parent_node, parent_depth)
     
     def _analyze_sva_time_window(self, 
                                   trigger_cycle: int,
