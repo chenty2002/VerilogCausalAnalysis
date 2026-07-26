@@ -432,6 +432,32 @@ class InstanceGraph:
         self._waveform_scope_modules.clear()
         return self
 
+    def exact_waveform_scopes_for_modules(
+        self, module_names: Iterable[str]
+    ) -> List[Tuple[str, str]]:
+        """Return exact waveform-only scopes with unique module signatures.
+
+        This exposes the same fail-closed join used by ``resolve_signal``.
+        Existing elaborated RTL instance paths are excluded, and no basename
+        or signal keyword participates in the selection.
+        """
+        if self._waveform_scope_signals is None:
+            return []
+        requested = set(module_names)
+        elaborated_paths = {row.instance_path for row in self.instances}
+        result: List[Tuple[str, str]] = []
+        for scope in sorted(self._waveform_scope_signals):
+            if scope in elaborated_paths:
+                continue
+            module_name = self._resolve_waveform_scope(scope)
+            if module_name not in requested:
+                continue
+            representative = min(
+                self._waveform_scope_signals[scope]
+            )
+            result.append((scope, f"{scope}.{representative}"))
+        return result
+
     def _resolve_waveform_scope(self, hierarchy: str) -> Optional[str]:
         if self._waveform_scope_signals is None:
             return None

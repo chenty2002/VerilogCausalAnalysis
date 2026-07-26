@@ -1,4 +1,4 @@
-"""Deterministic C2 compiler-net and register semantics.
+"""Deterministic C2/C3 Chisel lowering semantics.
 
 This module deliberately consumes parser and instance identities rather than
 temporary-name heuristics alone.  The resulting objects are reusable for every
@@ -23,6 +23,7 @@ NORMALIZED_DESIGN_SCHEMA = "chisel_normalized_design.v1"
 _C2_FEATURES = frozenset(
     {"compiler_net_normalization", "register_transition"}
 )
+_C3_FEATURES = frozenset({"aggregate", "handshake", "pipeline"})
 _TEMPORARY_RE = re.compile(
     r"^(?:_T(?:_\d+)?|_GEN(?:_\d+)?|.+_(?:T|GEN)(?:_\d+)?)$"
 )
@@ -36,6 +37,10 @@ class SemanticQueryError(ValueError):
 
 def c2_enabled(features: Iterable[str]) -> bool:
     return bool(_C2_FEATURES & set(features))
+
+
+def c3_enabled(features: Iterable[str]) -> bool:
+    return bool(_C3_FEATURES & set(features))
 
 
 def _local_members(parser: Any, text: str) -> Tuple[str, ...]:
@@ -491,9 +496,30 @@ def build_normalized_design(
     clock_signal: str,
     features: Sequence[str],
 ) -> Dict[str, Any]:
-    aliases = _alias_classes(graph, rtl_set_sha256)
-    expressions = _expression_groups(graph, rtl_set_sha256)
-    registers = _register_transitions(graph, rtl_set_sha256, clock_signal)
+    enabled = set(features)
+    aliases = (
+        _alias_classes(graph, rtl_set_sha256)
+        if "compiler_net_normalization" in enabled
+        else []
+    )
+    expressions = (
+        _expression_groups(graph, rtl_set_sha256)
+        if "compiler_net_normalization" in enabled
+        else []
+    )
+    registers = (
+        _register_transitions(graph, rtl_set_sha256, clock_signal)
+        if {"register_transition", "pipeline"} & enabled
+        else []
+    )
+    from .chisel_protocol_semantics import build_c3_semantics
+
+    c3 = build_c3_semantics(
+        graph,
+        rtl_set_sha256=rtl_set_sha256,
+        register_transitions=registers,
+        features=features,
+    )
     payload = {
         "schema_version": NORMALIZED_DESIGN_SCHEMA,
         "rtl_set_sha256": rtl_set_sha256,
@@ -503,9 +529,10 @@ def build_normalized_design(
         "alias_classes": aliases,
         "expression_groups": expressions,
         "register_transitions": registers,
-        "aggregates": [],
-        "handshakes": [],
-        "pipelines": [],
+        "aggregates": c3["aggregates"],
+        "handshakes": c3["handshakes"],
+        "pipelines": c3["pipelines"],
+        "blocking_relations": c3["blocking_relations"],
         "provenance_hints": [],
         "diagnostics": [],
     }
@@ -541,6 +568,15 @@ def get_raw_members(
             "register_id",
             "signal",
             "register_transition",
+        ),
+        ("aggregates", "aggregate_id", "member_signals", "aggregate"),
+        ("handshakes", "handshake_id", "member_signals", "handshake"),
+        ("pipelines", "pipeline_id", "member_signals", "pipeline"),
+        (
+            "blocking_relations",
+            "blocking_id",
+            "member_signals",
+            "blocking_relation",
         ),
     ):
         for row in normalized_design[collection]:

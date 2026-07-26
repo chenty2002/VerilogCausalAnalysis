@@ -593,6 +593,64 @@ class CycleAlignedWaveform:
                 if len(changes) >= max_changes:
                     break
         return changes
+
+    def get_transition_series_bounded(
+        self,
+        signal_name: str,
+        start_cycle: int,
+        end_cycle: int,
+        *,
+        max_values: int,
+    ) -> Dict[str, Any]:
+        """Return bounded cycle changes plus exact boundary/coverage metadata."""
+        if max_values <= 0:
+            raise ValueError("max_values must be positive")
+        changes = self.get_value_changes_bounded(
+            signal_name,
+            start_cycle,
+            end_cycle,
+            max_changes=max_values + 1,
+        )
+        start_value = self.get_signal_value(signal_name, start_cycle)
+        end_value = self.get_signal_value(signal_name, end_cycle)
+        if changes is None:
+            return {
+                "signal": signal_name,
+                "waveform_signal": signal_name,
+                "available": False,
+                "truncated": False,
+                "changes": [],
+                "boundary_values": {"start": start_value, "end": end_value},
+                "unknown_spans": [[start_cycle, end_cycle]],
+                "work": {
+                    "transition_values": 0,
+                    "value_misses": int(start_value is None)
+                    + int(end_value is None),
+                },
+            }
+        truncated = len(changes) > max_values
+        bounded = changes[:max_values]
+        return {
+            "signal": signal_name,
+            "waveform_signal": signal_name,
+            "available": True,
+            "truncated": truncated,
+            "changes": [
+                {"cycle": cycle, "old": old, "new": new}
+                for cycle, old, new in bounded
+            ],
+            "boundary_values": {"start": start_value, "end": end_value},
+            "unknown_spans": (
+                [[bounded[-1][0] if bounded else start_cycle, end_cycle]]
+                if truncated
+                else []
+            ),
+            "work": {
+                "transition_values": len(bounded),
+                "value_misses": int(start_value is None)
+                + int(end_value is None),
+            },
+        }
     
     def get_signal_transitions_in_cycle(self, signal_name: str, cycle: int) -> List[SignalTransition]:
         """

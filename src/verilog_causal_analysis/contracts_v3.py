@@ -1,4 +1,4 @@
-"""Typed opt-in request contract for the C0-C2 Chisel semantic profile."""
+"""Typed opt-in request contract for the C0-C4 Chisel semantic profile."""
 
 from __future__ import annotations
 
@@ -14,12 +14,16 @@ REQUEST_SCHEMA_V3 = "verilog_causal_request.v3"
 SEMANTIC_GRAPH_SCHEMA = "verilog_causal_semantic_graph.v1"
 CHISEL_PROFILE_VERSION = "chisel-semantic-profile.v1"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_C2_FEATURES = frozenset(
+_C4_FEATURES = frozenset(
     {
         "instance_graph",
         "endpoint_projection",
         "compiler_net_normalization",
         "register_transition",
+        "aggregate",
+        "handshake",
+        "pipeline",
+        "temporal_interval",
     }
 )
 
@@ -176,15 +180,34 @@ class CausalAnalysisRequestV3:
             or profile_row["version"] != CHISEL_PROFILE_VERSION
             or not isinstance(features, list)
             or not features
-            or any(item not in _C2_FEATURES for item in features)
+            or any(item not in _C4_FEATURES for item in features)
         ):
             raise ContractV3Error(
-                "C0-C2 support only the explicit chisel profile features "
-                f"{sorted(_C2_FEATURES)}"
+                "C0-C4 support only the explicit chisel profile features "
+                f"{sorted(_C4_FEATURES)}"
             )
         canonical_features = tuple(sorted(set(features)))
         if "instance_graph" not in canonical_features:
             raise ContractV3Error("C1 requires feature instance_graph")
+        if (
+            "handshake" in canonical_features
+            and "aggregate" not in canonical_features
+        ):
+            raise ContractV3Error("handshake requires feature aggregate")
+        if "pipeline" in canonical_features and not {
+            "aggregate",
+            "register_transition",
+        } <= set(canonical_features):
+            raise ContractV3Error(
+                "pipeline requires aggregate and register_transition"
+            )
+        if (
+            "temporal_interval" in canonical_features
+            and "register_transition" not in canonical_features
+        ):
+            raise ContractV3Error(
+                "temporal_interval requires register_transition"
+            )
         profile = SemanticProfileV3(
             "chisel", CHISEL_PROFILE_VERSION, canonical_features
         )

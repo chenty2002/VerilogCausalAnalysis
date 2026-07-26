@@ -1,4 +1,4 @@
-"""Public production surface for Verilog Causal Analysis V2.
+"""Public production surface for Verilog Causal Analysis V2/V3.
 
 Auto-detection remains available only to :mod:`verilog_causal_analysis.cli`
 through the private diagnostic module and is intentionally not re-exported.
@@ -58,6 +58,11 @@ from .query import (
     get_ranked_paths,
     prepare_query_view,
 )
+from .temporal_semantics import (
+    TEMPORAL_FEATURE,
+    build_transition_intervals,
+    get_semantic_paths,
+)
 
 __version__ = "2.3.0"
 
@@ -77,14 +82,14 @@ def prepare_causal_analysis(request):
 
 
 def build_causal_graph_v3(request, *, top_module=None):
-    """Build one opt-in C0-C2 Chisel semantic graph."""
+    """Build one opt-in C0-C4 Chisel semantic graph."""
     from .engine_v3 import build_causal_graph_v3 as _build
 
     return _build(request, top_module=top_module)
 
 
 def prepare_causal_session_v3(request, *, top_module=None):
-    """Prepare a reusable C0-C2 Chisel semantic session."""
+    """Prepare a reusable C0-C4 Chisel semantic session."""
     from .engine_v3 import prepare_causal_session_v3 as _prepare
 
     return _prepare(request, top_module=top_module)
@@ -116,6 +121,7 @@ __all__ = [
     "REQUEST_SCHEMA",
     "REQUEST_SCHEMA_V3",
     "SEMANTIC_GRAPH_SCHEMA",
+    "TEMPORAL_FEATURE",
     "SemanticQueryError",
     "build_causal_graph_v2",
     "build_causal_graph_v3",
@@ -126,6 +132,7 @@ __all__ = [
     "get_overview",
     "get_query_cache_statistics",
     "get_ranked_paths",
+    "get_semantic_paths",
     "get_raw_members",
     "get_register_transition",
     "make_request_v2",
@@ -133,6 +140,7 @@ __all__ = [
     "prepare_causal_analysis",
     "prepare_causal_session_v3",
     "prepare_query_view",
+    "build_transition_intervals",
     "sha256_file",
     "validate_graph_v2",
     "__version__",
