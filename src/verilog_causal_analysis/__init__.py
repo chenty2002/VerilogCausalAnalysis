@@ -22,6 +22,26 @@ from .identity import (
     canonical_sha256,
     sha256_file,
 )
+from .contracts_v3 import (
+    CHISEL_PROFILE_VERSION,
+    CausalAnalysisRequestV3,
+    ContractV3Error,
+    REQUEST_SCHEMA_V3,
+    SEMANTIC_GRAPH_SCHEMA,
+    make_request_v3,
+)
+from .endpoint_projection import (
+    ASSERTION_PROJECTION_SCHEMA,
+    AssertionEndpointProjection,
+    EndpointProjectionError,
+)
+from .instance_graph import (
+    INSTANCE_GRAPH_SCHEMA,
+    InstanceGraph,
+    InstanceGraphError,
+    InstanceNode,
+    PortBinding,
+)
 from .query import (
     GraphQueryView,
     QueryError,
@@ -50,19 +70,47 @@ def prepare_causal_analysis(request):
     return _prepare(request)
 
 
+def build_causal_graph_v3(request, *, top_module=None):
+    """Build one opt-in C1 instance-aware semantic graph."""
+    from .engine_v3 import build_causal_graph_v3 as _build
+
+    return _build(request, top_module=top_module)
+
+
+def prepare_causal_session_v3(request, *, top_module=None):
+    """Prepare a reusable C1 instance-aware semantic session."""
+    from .engine_v3 import prepare_causal_session_v3 as _prepare
+
+    return _prepare(request, top_module=top_module)
+
+
 __all__ = [
     "ANALYZER_REVISION",
+    "ASSERTION_PROJECTION_SCHEMA",
+    "AssertionEndpointProjection",
+    "CHISEL_PROFILE_VERSION",
     "CausalAnalysisRequestV2",
+    "CausalAnalysisRequestV3",
     "ContractError",
+    "ContractV3Error",
     "EVIDENCE_STRENGTHS",
     "GRAPH_SCHEMA",
     "GRAPH_STATUSES",
     "GraphQueryView",
     "HDLCONVERTOR_REVISION",
     "IDENTITY_STRENGTHS",
+    "INSTANCE_GRAPH_SCHEMA",
+    "InstanceGraph",
+    "InstanceGraphError",
+    "InstanceNode",
+    "EndpointProjectionError",
+    "PortBinding",
     "QueryError",
     "REQUEST_SCHEMA",
+    "REQUEST_SCHEMA_V3",
+    "SEMANTIC_GRAPH_SCHEMA",
     "build_causal_graph_v2",
+    "build_causal_graph_v3",
     "canonical_json_bytes",
     "canonical_sha256",
     "expand_predecessors",
@@ -71,7 +119,9 @@ __all__ = [
     "get_query_cache_statistics",
     "get_ranked_paths",
     "make_request_v2",
+    "make_request_v3",
     "prepare_causal_analysis",
+    "prepare_causal_session_v3",
     "prepare_query_view",
     "sha256_file",
     "validate_graph_v2",

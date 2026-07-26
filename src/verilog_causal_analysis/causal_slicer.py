@@ -638,9 +638,12 @@ class BackwardSlicer:
                  *,
                  exact_sva_trigger_cycle: Optional[int] = None,
                  allow_heuristic_sva_trigger: bool = False,
+                 dependency_provider: Optional[Any] = None,
                  ):
         """Initialize backward slicer with RTL parser and waveform data."""
         self.parser = verilog_parser
+        self.dependency_provider = dependency_provider or verilog_parser
+        self.instance_local_dependencies = dependency_provider is not None
         self.waveform = waveform
         self.max_depth = max_depth
         self.max_nodes = max_nodes
@@ -728,7 +731,9 @@ class BackwardSlicer:
 
     def _infer_module_name(self, signal: str, hierarchy: str = '') -> Optional[str]:
         """Infer RTL module name for a waveform signal when parser supports it."""
-        infer = getattr(self.parser, "infer_module_from_signal", None)
+        infer = getattr(
+            self.dependency_provider, "infer_module_from_signal", None
+        )
         if callable(infer):
             return infer(signal, hierarchy=hierarchy)
         return None
@@ -940,7 +945,12 @@ class BackwardSlicer:
         hierarchy = self._extract_module_hierarchy(endpoint_signal)
         module_hint = self._infer_module_name(endpoint_signal, hierarchy)
         
-        deps = self.parser.get_dependencies_for_signal(base_signal, module_hint)
+        lookup_signal = (
+            endpoint_signal if self.instance_local_dependencies else base_signal
+        )
+        deps = self.dependency_provider.get_dependencies_for_signal(
+            lookup_signal, module_hint
+        )
         if not deps:
             return None
         
@@ -1077,11 +1087,18 @@ class BackwardSlicer:
         base_signal = self._extract_base_signal_name(signal)
         signal_hierarchy = self._extract_module_hierarchy(signal)
         module_hint = self._infer_module_name(signal, signal_hierarchy or parent_hierarchy)
-        rtl_context = self.parser.get_rtl_context(base_signal, module_hint)
+        lookup_signal = (
+            signal if self.instance_local_dependencies else base_signal
+        )
+        rtl_context = self.dependency_provider.get_rtl_context(
+            lookup_signal, module_hint
+        )
         
         # If not found, try with original signal name
         if not rtl_context.get("found", False):
-            rtl_context = self.parser.get_rtl_context(original_signal, module_hint)
+            rtl_context = self.dependency_provider.get_rtl_context(
+                original_signal, module_hint
+            )
         
         node = CausalNode(
             id=node_id,
@@ -1511,6 +1528,7 @@ class BackwardSlicer:
         full_source = (
             f"{parent_hierarchy}.{dep.source}"
             if parent_hierarchy
+            and not dep.source.startswith(parent_hierarchy + ".")
             else dep.source
         )
         clean_node_signal = re.sub(r'\s*\[\d+:\d+\]$', '', node.signal)
@@ -1541,12 +1559,19 @@ class BackwardSlicer:
         module_hint = self._infer_module_name(node.signal, parent_hierarchy)
         
         # Get dependencies from RTL
-        deps = self.parser.get_dependencies_for_signal(base_signal, module_hint)
+        lookup_signal = (
+            node.signal if self.instance_local_dependencies else base_signal
+        )
+        deps = self.dependency_provider.get_dependencies_for_signal(
+            lookup_signal, module_hint
+        )
         
         if not deps:
             # Check if we can find with the full name (no width annotation)
             clean_signal = re.sub(r'\s*\[\d+:\d+\]$', '', node.signal)
-            deps = self.parser.get_dependencies_for_signal(clean_signal, module_hint)
+            deps = self.dependency_provider.get_dependencies_for_signal(
+                clean_signal, module_hint
+            )
         
         if not deps:
             # No RTL dependencies found, mark as potential root

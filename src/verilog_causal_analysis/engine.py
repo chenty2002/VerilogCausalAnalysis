@@ -339,6 +339,24 @@ def _convert_graph(
                 ),
             )
         )
+    endpoint_nodes = [row for row in nodes if row["is_endpoint"]]
+    if (
+        endpoint_nodes
+        and all(
+            row["rtl_context_status"] == "missing"
+            for row in endpoint_nodes
+        )
+        and not edges
+    ):
+        diagnostics.append(
+            _diagnostic(
+                "endpoint_rtl_context_missing",
+                (
+                    "endpoint has no parsed RTL dependency context and no "
+                    "hash-bound assertion projection"
+                ),
+            )
+        )
     return {
         "schema_version": GRAPH_SCHEMA,
         "graph_id": graph_id,
