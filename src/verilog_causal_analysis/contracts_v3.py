@@ -1,4 +1,4 @@
-"""Typed opt-in request contract for the C1 Chisel semantic profile."""
+"""Typed opt-in request contract for the C0-C2 Chisel semantic profile."""
 
 from __future__ import annotations
 
@@ -14,7 +14,14 @@ REQUEST_SCHEMA_V3 = "verilog_causal_request.v3"
 SEMANTIC_GRAPH_SCHEMA = "verilog_causal_semantic_graph.v1"
 CHISEL_PROFILE_VERSION = "chisel-semantic-profile.v1"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_C1_FEATURES = frozenset({"instance_graph", "endpoint_projection"})
+_C2_FEATURES = frozenset(
+    {
+        "instance_graph",
+        "endpoint_projection",
+        "compiler_net_normalization",
+        "register_transition",
+    }
+)
 
 
 class ContractV3Error(ValueError):
@@ -169,11 +176,11 @@ class CausalAnalysisRequestV3:
             or profile_row["version"] != CHISEL_PROFILE_VERSION
             or not isinstance(features, list)
             or not features
-            or any(item not in _C1_FEATURES for item in features)
+            or any(item not in _C2_FEATURES for item in features)
         ):
             raise ContractV3Error(
-                "C1 supports only the explicit chisel profile features "
-                f"{sorted(_C1_FEATURES)}"
+                "C0-C2 support only the explicit chisel profile features "
+                f"{sorted(_C2_FEATURES)}"
             )
         canonical_features = tuple(sorted(set(features)))
         if "instance_graph" not in canonical_features:

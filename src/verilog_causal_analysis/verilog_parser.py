@@ -367,6 +367,20 @@ class DependencyIndex:
 
 
 @dataclass
+class AssignmentRecord:
+    """Lossless assignment rule retained for semantic normalization."""
+
+    target: str
+    expression: str
+    condition: str
+    is_sequential: bool
+    statement_id: str
+    file_path: str
+    line_start: int
+    line_end: int
+
+
+@dataclass
 class ModuleInfo:
     """Verilog module information."""
     name: str
@@ -376,6 +390,7 @@ class ModuleInfo:
     ports: Dict[str, SignalInfo] = field(default_factory=dict)
     signals: Dict[str, SignalInfo] = field(default_factory=dict)
     dependencies: List[Dependency] = field(default_factory=list)
+    assignment_records: List[AssignmentRecord] = field(default_factory=list)
     submodule_instances: List[Tuple[str, str, int]] = field(default_factory=list)
 
 
@@ -781,6 +796,31 @@ class VerilogParser:
             line_start, line_end = self._get_position(assign)
             
             dep_type = DependencyType.SEQUENTIAL if is_sequential else DependencyType.COMBINATIONAL
+            assignment_statement = StatementEvidence.create(
+                expression=expr_str,
+                file_path=file_path,
+                line_start=line_start,
+                line_end=line_end,
+                code_snippet=self._get_code_snippet(
+                    file_path, line_start, line_end
+                ),
+                condition=condition,
+                module_name=module.name,
+                target=target,
+                target_qualified=self._qualify_signal(module, target),
+            )
+            module.assignment_records.append(
+                AssignmentRecord(
+                    target,
+                    expr_str,
+                    condition,
+                    is_sequential,
+                    assignment_statement.statement_id,
+                    file_path,
+                    line_start,
+                    line_end,
+                )
+            )
             
             for source in sorted(sources):
                 if source != target:  # Avoid self-loops
@@ -825,6 +865,26 @@ class VerilogParser:
                 expr_str = self._expr_to_string(assign.ops[1])
                 
                 dep_type = DependencyType.SEQUENTIAL if is_sequential else DependencyType.COMBINATIONAL
+                assignment_statement = StatementEvidence.create(
+                    expression=expr_str,
+                    file_path=file_path,
+                    condition=condition,
+                    module_name=module.name,
+                    target=target,
+                    target_qualified=self._qualify_signal(module, target),
+                )
+                module.assignment_records.append(
+                    AssignmentRecord(
+                        target,
+                        expr_str,
+                        condition,
+                        is_sequential,
+                        assignment_statement.statement_id,
+                        file_path,
+                        0,
+                        0,
+                    )
+                )
                 
                 for source in sorted(sources):
                     if source != target:
@@ -1349,6 +1409,28 @@ class VerilogParser:
                         list(row)
                         for row in sorted(module.submodule_instances)
                     ],
+                    "assignment_records": [
+                        {
+                            "target": row.target,
+                            "expression": row.expression,
+                            "condition": row.condition,
+                            "is_sequential": row.is_sequential,
+                            "statement_id": row.statement_id,
+                            "artifact_id": artifact_id(row.file_path),
+                            "line_start": row.line_start,
+                            "line_end": row.line_end,
+                        }
+                        for row in sorted(
+                            module.assignment_records,
+                            key=lambda row: (
+                                row.line_start,
+                                row.line_end,
+                                row.target,
+                                row.condition,
+                                row.expression,
+                            ),
+                        )
+                    ],
                 }
             )
 
@@ -1452,6 +1534,27 @@ class VerilogParser:
                     str(port_name)
                 ]
             parser.modules[module.name] = module
+            for assignment_row in module_row.get(
+                "assignment_records", []
+            ):
+                module.assignment_records.append(
+                    AssignmentRecord(
+                        target=str(assignment_row["target"]),
+                        expression=str(assignment_row["expression"]),
+                        condition=str(assignment_row["condition"]),
+                        is_sequential=bool(
+                            assignment_row["is_sequential"]
+                        ),
+                        statement_id=str(
+                            assignment_row["statement_id"]
+                        ),
+                        file_path=source_path(
+                            str(assignment_row["artifact_id"])
+                        ),
+                        line_start=int(assignment_row["line_start"]),
+                        line_end=int(assignment_row["line_end"]),
+                    )
+                )
             for instance_name, child_module, _line in (
                 module.submodule_instances
             ):

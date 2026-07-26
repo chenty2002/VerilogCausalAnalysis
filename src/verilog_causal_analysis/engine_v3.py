@@ -1,10 +1,16 @@
-"""C1 instance-aware execution for the explicit V3 Chisel profile."""
+"""C0-C2 execution for the explicit V3 Chisel profile."""
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, Mapping, Optional
 
 from .causal_slicer import BackwardSlicer
+from .chisel_semantics import (
+    build_normalized_design,
+    c2_enabled,
+    persistent_intervals,
+)
 from .contracts import make_request_v2
 from .contracts_v3 import (
     CausalAnalysisRequestV3,
@@ -19,6 +25,30 @@ from .endpoint_projection import (
 from .engine import PreparedCausalAnalysis, _convert_graph, _diagnostic
 from .identity import ANALYZER_REVISION, stable_id, stable_set_sha256
 from .instance_graph import InstanceGraph, InstanceGraphError
+
+
+class _SemanticBoundaryProvider:
+    """Stop raw recursion at registers represented by C2 semantic objects."""
+
+    def __init__(self, provider: Any, register_signals: set[str]):
+        self._provider = provider
+        self._register_signals = register_signals
+
+    @staticmethod
+    def _clean(signal: str) -> str:
+        return re.sub(r"\s*\[\d+:\d+\]$", "", signal)
+
+    def get_dependencies_for_signal(
+        self, signal: str, module_name: Optional[str] = None
+    ):
+        if self._clean(signal) in self._register_signals:
+            return []
+        return self._provider.get_dependencies_for_signal(
+            signal, module_name
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._provider, name)
 
 
 def _v2_request(request: CausalAnalysisRequestV3):
@@ -55,7 +85,11 @@ def _identity(request: CausalAnalysisRequestV3) -> Dict[str, Any]:
             [item.identity_dict() for item in request.rtl_files]
         ),
         "trace_sha256": request.trace.sha256,
-        "analyzer_revision": f"{ANALYZER_REVISION}+c1",
+        "analyzer_revision": (
+            f"{ANALYZER_REVISION}+c2"
+            if c2_enabled(request.semantic_profile.features)
+            else f"{ANALYZER_REVISION}+c1"
+        ),
         "profile_version": CHISEL_PROFILE_VERSION,
     }
 
@@ -115,10 +149,22 @@ class PreparedCausalSessionV3:
         except InstanceGraphError:
             self._prepared.close()
             raise
+        self._normalized_design = (
+            build_normalized_design(
+                self.instance_graph,
+                rtl_set_sha256=_identity(request)["rtl_set_sha256"],
+                clock_signal=request.clock_signal,
+                features=request.semantic_profile.features,
+            )
+            if c2_enabled(request.semantic_profile.features)
+            else None
+        )
         self._closed = False
 
     @property
     def normalized_design(self) -> Dict[str, Any]:
+        if self._normalized_design is not None:
+            return self._normalized_design
         return self.instance_graph.to_dict()
 
     def build(
@@ -183,9 +229,36 @@ class PreparedCausalSessionV3:
                 )
                 return _empty_graph(request, diagnostics)
 
-        provider = ProjectedDependencyProvider(
+        provider: Any = ProjectedDependencyProvider(
             self.instance_graph, projection
         )
+        projection_members = {
+            re.sub(r"\s*\[\d+:\d+\]$", "", member)
+            for member in (
+                projection.predicate_members
+                if projection is not None
+                else ()
+            )
+        }
+        selected_transitions = []
+        if self._normalized_design is not None:
+            all_transitions = self._normalized_design[
+                "register_transitions"
+            ]
+            selected_transitions = [
+                row
+                for row in all_transitions
+                if not projection_members
+                or re.sub(r"\s*\[\d+:\d+\]$", "", row["signal"])
+                in projection_members
+            ]
+            provider = _SemanticBoundaryProvider(
+                provider,
+                {
+                    re.sub(r"\s*\[\d+:\d+\]$", "", row["signal"])
+                    for row in selected_transitions
+                },
+            )
         if not self._prepared.waveform.has_exact_signal(
             request.endpoint.signal
         ):
@@ -287,7 +360,133 @@ class PreparedCausalSessionV3:
                     "inference_rule": "controller_supplied_exact",
                 }
             )
+        interval_diagnostics: list[Dict[str, Any]] = []
+        if self._normalized_design is not None:
+            for transition in selected_transitions:
+                semantic_nodes.append(
+                    {
+                        "semantic_id": transition["register_id"],
+                        "type": "register_transition",
+                        "signal": transition["signal"],
+                        "clock_signal": transition["clock_signal"],
+                        "reset_rules": transition["reset_rules"],
+                        "update_rules": transition["update_rules"],
+                        "hold_rule": transition["hold_rule"],
+                        "counter_pattern": transition["counter_pattern"],
+                        "statement_ids": transition["statement_ids"],
+                        "inference_rule": transition["inference_rule"],
+                    }
+                )
+            intervals, interval_diagnostics = persistent_intervals(
+                self._normalized_design,
+                self._prepared.waveform,
+                end_cycle=request.endpoint.cycle,
+                max_intervals=request.bounds["max_intervals_per_signal"],
+                max_temporal_samples=request.bounds["max_temporal_samples"],
+                subject_signals=(
+                    projection.predicate_members
+                    if projection is not None
+                    else None
+                ),
+            )
+            semantic_nodes.extend(intervals)
+            semantic_nodes.sort(key=lambda row: row["semantic_id"])
+            semantic_by_id = {
+                row["semantic_id"]: row for row in semantic_nodes
+            }
+            predicate_nodes = [
+                row
+                for row in semantic_nodes
+                if row["type"] == "assertion_predicate"
+            ]
+            register_nodes = [
+                row
+                for row in semantic_nodes
+                if row["type"] == "register_transition"
+            ]
+            for interval in (
+                row
+                for row in semantic_nodes
+                if row["type"] == "persistent_interval"
+            ):
+                if interval["register_id"] not in semantic_by_id:
+                    continue
+                graph_edges.append(
+                    {
+                        "edge_id": stable_id(
+                            "vcse_",
+                            identity,
+                            interval["semantic_id"],
+                            interval["register_id"],
+                            "persistent_update_rule",
+                            length=24,
+                        ),
+                        "src_semantic_id": interval["semantic_id"],
+                        "dst_semantic_id": interval["register_id"],
+                        "relation": "persistent_update_rule",
+                        "evidence_strength": interval["observation"],
+                        "dynamic_score": interval["dynamic_score"],
+                    }
+                )
+            for predicate in predicate_nodes:
+                predicate_members = {
+                    re.sub(r"\s*\[\d+:\d+\]$", "", member)
+                    for member in predicate["member_signals"]
+                }
+                for register in register_nodes:
+                    if (
+                        re.sub(
+                            r"\s*\[\d+:\d+\]$",
+                            "",
+                            register["signal"],
+                        )
+                        not in predicate_members
+                    ):
+                        continue
+                    graph_edges.append(
+                        {
+                            "edge_id": stable_id(
+                                "vcse_",
+                                identity,
+                                register["semantic_id"],
+                                predicate["semantic_id"],
+                                "predicate_member",
+                                length=24,
+                            ),
+                            "src_semantic_id": register["semantic_id"],
+                            "dst_semantic_id": predicate["semantic_id"],
+                            "relation": "predicate_member",
+                            "evidence_strength": "exact",
+                            "dynamic_score": 1.0,
+                        }
+                    )
         all_diagnostics = raw["diagnostics"]
+        all_diagnostics.extend(interval_diagnostics)
+        max_semantic_nodes_reached = (
+            len(semantic_nodes) > request.bounds["max_semantic_nodes"]
+        )
+        if max_semantic_nodes_reached:
+            semantic_nodes = semantic_nodes[
+                : request.bounds["max_semantic_nodes"]
+            ]
+            retained_semantic_ids = {
+                row["semantic_id"] for row in semantic_nodes
+            }
+            graph_edges = [
+                row
+                for row in graph_edges
+                if "src_semantic_id" not in row
+                or (
+                    row["src_semantic_id"] in retained_semantic_ids
+                    and row["dst_semantic_id"] in retained_semantic_ids
+                )
+            ]
+            all_diagnostics.append(
+                _diagnostic(
+                    "graph_max_semantic_nodes_reached",
+                    "semantic graph reached max_semantic_nodes",
+                )
+            )
         max_edges_reached = len(graph_edges) > request.bounds["max_edges"]
         if max_edges_reached:
             graph_edges = graph_edges[: request.bounds["max_edges"]]
@@ -318,7 +517,7 @@ class PreparedCausalSessionV3:
             "bounds": {
                 **dict(request.bounds),
                 "signal_nodes_reached": raw["bounds"]["max_nodes_reached"],
-                "semantic_nodes_reached": False,
+                "semantic_nodes_reached": max_semantic_nodes_reached,
                 "edges_reached": max_edges_reached,
             },
             "diagnostics": sorted(

@@ -488,6 +488,7 @@ def _parsed_design_cache_key(
             "hdlconvertor_revision": HDLCONVERTOR_REVISION,
             "parser_language_policy": "closure-system-verilog-if-any-v1",
             "include_policy": "required-artifact-directories-v1",
+            "semantic_assignment_records": "assignment-records-v1",
             "strict": request.strict,
         }
     )

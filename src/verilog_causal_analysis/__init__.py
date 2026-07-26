@@ -42,6 +42,12 @@ from .instance_graph import (
     InstanceNode,
     PortBinding,
 )
+from .chisel_semantics import (
+    NORMALIZED_DESIGN_SCHEMA,
+    SemanticQueryError,
+    get_raw_members,
+    get_register_transition,
+)
 from .query import (
     GraphQueryView,
     QueryError,
@@ -71,14 +77,14 @@ def prepare_causal_analysis(request):
 
 
 def build_causal_graph_v3(request, *, top_module=None):
-    """Build one opt-in C1 instance-aware semantic graph."""
+    """Build one opt-in C0-C2 Chisel semantic graph."""
     from .engine_v3 import build_causal_graph_v3 as _build
 
     return _build(request, top_module=top_module)
 
 
 def prepare_causal_session_v3(request, *, top_module=None):
-    """Prepare a reusable C1 instance-aware semantic session."""
+    """Prepare a reusable C0-C2 Chisel semantic session."""
     from .engine_v3 import prepare_causal_session_v3 as _prepare
 
     return _prepare(request, top_module=top_module)
@@ -100,6 +106,7 @@ __all__ = [
     "HDLCONVERTOR_REVISION",
     "IDENTITY_STRENGTHS",
     "INSTANCE_GRAPH_SCHEMA",
+    "NORMALIZED_DESIGN_SCHEMA",
     "InstanceGraph",
     "InstanceGraphError",
     "InstanceNode",
@@ -109,6 +116,7 @@ __all__ = [
     "REQUEST_SCHEMA",
     "REQUEST_SCHEMA_V3",
     "SEMANTIC_GRAPH_SCHEMA",
+    "SemanticQueryError",
     "build_causal_graph_v2",
     "build_causal_graph_v3",
     "canonical_json_bytes",
@@ -118,6 +126,8 @@ __all__ = [
     "get_overview",
     "get_query_cache_statistics",
     "get_ranked_paths",
+    "get_raw_members",
+    "get_register_transition",
     "make_request_v2",
     "make_request_v3",
     "prepare_causal_analysis",
