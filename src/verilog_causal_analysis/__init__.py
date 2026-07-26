@@ -30,7 +30,7 @@ from .query import (
     get_ranked_paths,
 )
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 
 def build_causal_graph_v2(request):

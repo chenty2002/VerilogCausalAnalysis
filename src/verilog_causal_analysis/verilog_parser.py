@@ -12,11 +12,14 @@ Key classes from hdlConvertorAst:
 - HdlOp: Operations and expressions
 """
 
+import copy
+import hashlib
 import os
 import re
 import tempfile
+from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Set, Tuple, Optional, Any
+from typing import Dict, Iterable, List, Set, Tuple, Optional, Any
 from enum import Enum
 
 from hdlConvertor import HdlConvertor
@@ -88,6 +91,156 @@ class Dependency:
         }
 
 
+@dataclass(frozen=True)
+class DependencyLookupResult:
+    """Stable result from the indexed target-dependency lookup."""
+
+    dependencies: Tuple[Dependency, ...]
+    identity_strength: str
+    ambiguous: bool
+
+
+@dataclass(frozen=True)
+class _IndexedDependencyArc:
+    """Pre-normalized dependency fields used only by :class:`DependencyIndex`."""
+
+    dependency_id: str
+    ordinal: int
+    dependency: Dependency
+    module_name: str
+    target_clean: str
+    target_qualified: str
+    target_base: str
+
+
+class DependencyIndex:
+    """Immutable-key, incrementally built target index for parsed dependencies.
+
+    Lookup intentionally preserves the precedence and matching behavior of the
+    former linear ``_dependency_matches_target`` implementation.  Candidate
+    buckets narrow the work to matching names; the final predicate is evaluated
+    only over those candidates and results remain in parser insertion order.
+    """
+
+    def __init__(self) -> None:
+        self._arcs: Dict[int, _IndexedDependencyArc] = {}
+        self._by_target_clean: Dict[str, List[int]] = defaultdict(list)
+        self._by_target_qualified: Dict[str, List[int]] = defaultdict(list)
+        self._by_target_base: Dict[str, List[int]] = defaultdict(list)
+
+    @staticmethod
+    def _dependency_id(dep: Dependency) -> str:
+        payload = "\x1f".join(
+            (
+                dep.module_name,
+                dep.source_qualified or dep.source,
+                dep.target_qualified or dep.target,
+                dep.dep_type.value,
+                str(dep.line_start),
+                str(dep.line_end),
+                dep.code_snippet,
+                dep.expression,
+                dep.condition,
+            )
+        )
+        return "vcd_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+    def add(self, dep: Dependency, ordinal: int) -> None:
+        target_clean = VerilogParser._strip_width(dep.target)
+        target_qualified = VerilogParser._strip_width(dep.target_qualified)
+        target_base = VerilogParser._base_signal_name(target_clean)
+        arc = _IndexedDependencyArc(
+            dependency_id=self._dependency_id(dep),
+            ordinal=ordinal,
+            dependency=dep,
+            module_name=dep.module_name,
+            target_clean=target_clean,
+            target_qualified=target_qualified,
+            target_base=target_base,
+        )
+        self._arcs[ordinal] = arc
+        self._by_target_clean[target_clean].append(ordinal)
+        self._by_target_qualified[target_qualified].append(ordinal)
+        self._by_target_base[target_base].append(ordinal)
+
+    @classmethod
+    def from_dependencies(cls, dependencies: Iterable[Dependency]) -> "DependencyIndex":
+        index = cls()
+        for ordinal, dep in enumerate(dependencies):
+            index.add(dep, ordinal)
+        return index
+
+    @staticmethod
+    def _suffixes(clean_signal: str) -> Iterable[str]:
+        parts = clean_signal.split(".")
+        for index in range(1, len(parts)):
+            yield ".".join(parts[index:])
+
+    @staticmethod
+    def _matches(
+        arc: _IndexedDependencyArc,
+        clean_signal: str,
+        base_signal: str,
+        module_name: Optional[str],
+    ) -> bool:
+        if clean_signal in {arc.target_clean, arc.target_qualified}:
+            return True
+        if "." in clean_signal and clean_signal.endswith("." + arc.target_clean):
+            return True
+        if module_name and arc.module_name and arc.module_name != module_name:
+            return False
+        if module_name and arc.target_base == base_signal:
+            return True
+        return arc.target_base == base_signal and not module_name
+
+    @staticmethod
+    def _identity_strength(
+        arc: _IndexedDependencyArc,
+        clean_signal: str,
+    ) -> str:
+        if clean_signal in {arc.target_clean, arc.target_qualified}:
+            return "exact"
+        if "." in clean_signal and clean_signal.endswith("." + arc.target_clean):
+            return "hierarchy_inferred"
+        return "basename_fallback"
+
+    def lookup(
+        self,
+        signal_name: str,
+        module_name: Optional[str],
+    ) -> DependencyLookupResult:
+        clean = VerilogParser._strip_width(signal_name)
+        base = VerilogParser._base_signal_name(clean)
+        candidate_ordinals: Set[int] = set(self._by_target_clean.get(clean, ()))
+        candidate_ordinals.update(self._by_target_qualified.get(clean, ()))
+        for suffix in self._suffixes(clean):
+            candidate_ordinals.update(self._by_target_clean.get(suffix, ()))
+        candidate_ordinals.update(self._by_target_base.get(base, ()))
+
+        matched: List[_IndexedDependencyArc] = []
+        strengths: List[str] = []
+        for ordinal in sorted(candidate_ordinals):
+            arc = self._arcs[ordinal]
+            if self._matches(arc, clean, base, module_name):
+                matched.append(arc)
+                strengths.append(self._identity_strength(arc, clean))
+
+        strength = "unresolved"
+        for candidate in ("exact", "hierarchy_inferred", "basename_fallback"):
+            if candidate in strengths:
+                strength = candidate
+                break
+        identities = {
+            (arc.module_name, arc.target_qualified or arc.target_clean)
+            for arc in matched
+        }
+        return DependencyLookupResult(
+            dependencies=tuple(arc.dependency for arc in matched),
+            identity_strength=strength,
+            ambiguous=len(identities) > 1,
+        )
+
+
 @dataclass
 class ModuleInfo:
     """Verilog module information."""
@@ -147,6 +300,9 @@ class VerilogParser:
         self.modules: Dict[str, ModuleInfo] = {}
         self.all_signals: Dict[str, SignalInfo] = {}
         self.all_dependencies: List[Dependency] = []
+        self._dependency_index = DependencyIndex()
+        self._dependency_index_size = 0
+        self._rtl_context_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self.instance_module_map: Dict[str, Set[str]] = {}
         self.file_contents: Dict[str, str] = {}
         self.file_lines: Dict[str, List[str]] = {}
@@ -345,6 +501,22 @@ class VerilogParser:
         """Add a dependency to module-local and global registries."""
         module.dependencies.append(dep)
         self.all_dependencies.append(dep)
+        self._dependency_index.add(dep, self._dependency_index_size)
+        self._dependency_index_size += 1
+        self._rtl_context_cache.clear()
+
+    def rebuild_dependency_index(self) -> None:
+        """Rebuild the index after intentional direct dependency-list mutation."""
+        self._dependency_index = DependencyIndex.from_dependencies(self.all_dependencies)
+        self._dependency_index_size = len(self.all_dependencies)
+        self._rtl_context_cache.clear()
+
+    def _ensure_dependency_index(self) -> None:
+        # Production extraction goes through ``_add_dependency``.  The length
+        # guard keeps older callers that directly append test dependencies safe
+        # without reintroducing a per-lookup scan.
+        if self._dependency_index_size != len(self.all_dependencies):
+            self.rebuild_dependency_index()
 
     def _get_port_direction(self, module_name: str, port_name: str) -> Optional[str]:
         """Look up a submodule port direction if that module has been parsed."""
@@ -840,6 +1012,7 @@ class VerilogParser:
         
         # Parse SVA assertions (hdlConvertor may skip these)
         self._parse_sva_assertions(file_path, modules)
+        self._rtl_context_cache.clear()
 
         if self.strict and not modules:
             diagnostic = {
@@ -1073,12 +1246,19 @@ class VerilogParser:
 
     def get_dependencies_for_signal(self, signal_name: str, module_name: Optional[str] = None) -> List[Dependency]:
         """Get all dependencies where signal is the target."""
+        return list(
+            self.lookup_dependencies(signal_name, module_name).dependencies
+        )
+
+    def lookup_dependencies(
+        self,
+        signal_name: str,
+        module_name: Optional[str] = None,
+    ) -> DependencyLookupResult:
+        """Return indexed dependencies plus conservative identity metadata."""
+        self._ensure_dependency_index()
         inferred_module = module_name or self.infer_module_from_signal(signal_name)
-        deps = []
-        for dep in self.all_dependencies:
-            if self._dependency_matches_target(dep, signal_name, inferred_module):
-                deps.append(dep)
-        return deps
+        return self._dependency_index.lookup(signal_name, inferred_module)
     
     def get_signal_sources(self, signal_name: str, module_name: Optional[str] = None) -> List[Tuple[str, DependencyType]]:
         """Get all signals that are sources for a given signal."""
@@ -1102,6 +1282,11 @@ class VerilogParser:
     def get_rtl_context(self, signal_name: str, module_name: Optional[str] = None) -> Dict[str, Any]:
         """Get RTL context for a signal."""
         inferred_module = module_name or self.infer_module_from_signal(signal_name)
+        clean_signal = self._strip_width(signal_name)
+        cache_key = (inferred_module or "", clean_signal)
+        cached = self._rtl_context_cache.get(cache_key)
+        if cached is not None:
+            return copy.deepcopy(cached)
         base_signal = self._base_signal_name(signal_name)
         context = {
             "signal_name": signal_name,
@@ -1143,4 +1328,5 @@ class VerilogParser:
                 "type": dep.dep_type.value
             })
         
+        self._rtl_context_cache[cache_key] = copy.deepcopy(context)
         return context

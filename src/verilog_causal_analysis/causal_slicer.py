@@ -447,6 +447,11 @@ class BackwardSlicer:
         self.waveform = waveform
         self.max_depth = max_depth
         self.max_nodes = max_nodes
+        # V2.1 derives deterministic work limits from max_nodes.  In
+        # particular, none of these limits expands when max_depth changes.
+        self.weak_edge_budget = max(0, (max_nodes - 1) // 4)
+        self.weak_beam_width = 2
+        self.candidate_evaluation_budget = max_nodes * 8
         self.dep_graph = verilog_parser.build_dependency_graph()
         self._signal_sources_cache: Dict[str, List[str]] = {}
         
@@ -461,11 +466,21 @@ class BackwardSlicer:
         # SVA time window pattern: ##[min:max] or ##N
         self._re_sva_time_window = re.compile(r'##\[(\d+):(\d+)\]|##(\d+)')
         
-        self.stats = {
+        self.stats = self._new_stats()
+
+    def _new_stats(self) -> Dict[str, Any]:
+        return {
             "nodes_created": 0,
             "edges_created": 0,
             "max_depth_reached": False,
             "max_nodes_reached": False,
+            "candidate_evaluations": 0,
+            "candidate_evaluation_budget": self.candidate_evaluation_budget,
+            "candidate_evaluation_budget_reached": False,
+            "rejected_candidates": 0,
+            "weak_edges_admitted": 0,
+            "weak_edge_budget": self.weak_edge_budget,
+            "weak_beam_width": self.weak_beam_width,
             "undetermined_nodes": 0,
             "sva_trigger_cycle": None,
             "sva_time_window": None,  # (min_delay, max_delay) if SVA has time window
@@ -763,9 +778,9 @@ class BackwardSlicer:
         
         return trigger_cycle
     
-    def _get_or_create_node(self, signal: str, cycle: int, depth: int, 
-                            parent_hierarchy: str = '') -> Optional[CausalNode]:
-        """Get existing node or create a new one."""
+    def _prepare_node(self, signal: str, cycle: int, depth: int,
+                      parent_hierarchy: str = '') -> Tuple[CausalNode, bool]:
+        """Resolve a candidate node without consuming graph node budget."""
         original_signal = signal
         match_cache: Dict[str, List[str]] = {}
         value, resolved_signal = self._resolve_signal_value(
@@ -780,11 +795,7 @@ class BackwardSlicer:
         node_id = self._make_node_id(signal, cycle, value)
         
         if node_id in self.nodes:
-            return self.nodes[node_id]
-        
-        if len(self.nodes) >= self.max_nodes:
-            self.stats["max_nodes_reached"] = True
-            return None
+            return self.nodes[node_id], False
         
         # Get RTL context using base signal name (without hierarchy prefix)
         base_signal = self._extract_base_signal_name(signal)
@@ -816,13 +827,47 @@ class BackwardSlicer:
             ),
         )
         
-        self.nodes[node_id] = node
+        return node, True
+
+    def _commit_node(self, node: CausalNode, is_new: bool) -> Optional[CausalNode]:
+        """Commit a prepared node after admission, if graph capacity permits."""
+        existing = self.nodes.get(node.id)
+        if existing is not None:
+            return existing
+        if not is_new:
+            return node
+        if len(self.nodes) >= self.max_nodes:
+            self.stats["max_nodes_reached"] = True
+            return None
+        self.nodes[node.id] = node
         self.stats["nodes_created"] += 1
-        
         if node.rtl_context_missing:
             self.stats["undetermined_nodes"] += 1
-        
         return node
+
+    def _get_or_create_node(self, signal: str, cycle: int, depth: int,
+                            parent_hierarchy: str = '') -> Optional[CausalNode]:
+        """Create an explicitly admitted endpoint or synthetic SVA node."""
+        node, is_new = self._prepare_node(
+            signal, cycle, depth, parent_hierarchy
+        )
+        return self._commit_node(node, is_new)
+
+    def _commit_candidate(
+        self,
+        parent_node: CausalNode,
+        parent_is_new: bool,
+        edge: CausalEdge,
+    ) -> Optional[CausalNode]:
+        """Atomically admit the source endpoint and its causal edge."""
+        committed = self._commit_node(parent_node, parent_is_new)
+        if committed is None:
+            return None
+        edge.src_node_id = committed.id
+        self.edges.append(edge)
+        self._edge_set.add((committed.id, edge.dst_node_id))
+        self.stats["edges_created"] += 1
+        return committed
     
     def _get_parent_cycle(self, dep: Dependency, target_cycle: int) -> int:
         """
@@ -1068,6 +1113,36 @@ class BackwardSlicer:
             })
         
         return is_causal, score, examples
+
+    def _expandable_parent_cycle(
+        self,
+        node: CausalNode,
+        dep: Dependency,
+        parent_hierarchy: str,
+    ) -> Optional[int]:
+        """Return the parent cycle only for a dependency eligible to expand."""
+        parent_cycle = self._get_parent_cycle(dep, node.cycle)
+        if parent_cycle < 0:
+            return None
+        source_base = self._extract_base_signal_name(dep.source)
+        target_base = self._extract_base_signal_name(node.signal)
+        if source_base == target_base or source_base in _IGNORED_SIGNALS:
+            return None
+        if dep.source == node.signal:
+            return None
+        full_source = (
+            f"{parent_hierarchy}.{dep.source}"
+            if parent_hierarchy
+            else dep.source
+        )
+        clean_node_signal = re.sub(r'\s*\[\d+:\d+\]$', '', node.signal)
+        full_source_base = full_source.rsplit('.', 1)[-1]
+        if (
+            (full_source == clean_node_signal or full_source_base == target_base)
+            and dep.dep_type == DependencyType.COMBINATIONAL
+        ):
+            return None
+        return parent_cycle
     
     def _slice_node(self, node: CausalNode, depth: int):
         """
@@ -1077,10 +1152,6 @@ class BackwardSlicer:
             node: Current node to slice from
             depth: Current depth
         """
-        if depth > self.max_depth:
-            self.stats["max_depth_reached"] = True
-            return
-        
         if node.id in self.visited:
             return
         
@@ -1104,50 +1175,43 @@ class BackwardSlicer:
             node.is_root = True
             return
 
-        parents_to_recurse: List[Tuple[CausalNode, int]] = []
+        candidates = [
+            (dep, parent_cycle)
+            for dep in deps
+            for parent_cycle in [
+                self._expandable_parent_cycle(node, dep, parent_hierarchy)
+            ]
+            if parent_cycle is not None
+        ]
+        if not candidates:
+            node.is_root = True
+            return
+        if depth >= self.max_depth:
+            # max_depth is the maximum number of edge hops from the endpoint:
+            # the current node may exist at the limit, but no parent may be
+            # materialized beyond it.
+            self.stats["max_depth_reached"] = True
+            return
 
-        for dep in deps:
-            # Determine parent cycle
-            parent_cycle = self._get_parent_cycle(dep, node.cycle)
-            
-            if parent_cycle < 0:
-                continue
-            
-            # Check for self-dependency before creating node
-            # A signal depending on itself in the same cycle is not valid causality
-            source_base = self._extract_base_signal_name(dep.source)
-            target_base = self._extract_base_signal_name(node.signal)
-            
-            # Skip if source and target are the same signal (avoid self-loops)
-            if source_base == target_base:
-                continue
-            
-            # Skip reset-related auxiliary signals (hasBeenReset, hasBeenResetReg, reset)
-            if source_base in _IGNORED_SIGNALS:
-                continue
-            
-            # Also check if full signal names match (with hierarchy)
-            if dep.source == node.signal:
-                continue
-            
-            # Check if the source (with hierarchy) matches node signal
-            full_source = f"{parent_hierarchy}.{dep.source}" if parent_hierarchy else dep.source
-            clean_node_signal = re.sub(r'\s*\[\d+:\d+\]$', '', node.signal)
-            full_source_base = full_source.rsplit('.', 1)[-1]
-            if full_source == clean_node_signal or full_source_base == target_base:
-                if dep.dep_type == DependencyType.COMBINATIONAL:
-                    # Combinational self-dependency is not allowed
-                    continue
-            
-            # Create parent node with hierarchy context
-            parent_node = self._get_or_create_node(
+        parents_to_recurse: List[Tuple[CausalNode, int]] = []
+        weak_edges_for_target = 0
+
+        for dep, parent_cycle in candidates:
+            if (
+                self.stats["candidate_evaluations"]
+                >= self.candidate_evaluation_budget
+            ):
+                self.stats["candidate_evaluation_budget_reached"] = True
+                break
+
+            # Resolve identity/value/context without committing the candidate.
+            parent_node, parent_is_new = self._prepare_node(
                 dep.source, parent_cycle, depth + 1, parent_hierarchy
             )
-            if parent_node is None:
-                continue
             
             # Final self-loop check using node IDs
             if parent_node.id == node.id:
+                self.stats["rejected_candidates"] += 1
                 continue
             
             # Check for duplicate edges
@@ -1156,6 +1220,7 @@ class BackwardSlicer:
                 continue  # Skip duplicate edge
             
             # Evaluate causality using full signal names from nodes
+            self.stats["candidate_evaluations"] += 1
             is_causal, score, examples = self._evaluate_counterfactual(
                 node.signal, node.cycle,
                 parent_node.signal, parent_cycle,
@@ -1179,22 +1244,22 @@ class BackwardSlicer:
                         "value": parent_node.value
                     }]
             
-            if not is_causal and not node.rtl_context_missing:
+            weak_candidate = not is_causal
+            if weak_candidate and not node.rtl_context_missing:
                 # Counterfactual did not show causality, but we may still want to track
                 # this dependency based on RTL structure for deeper exploration
-                # Use a lower score to indicate it's structural dependency only
-                if depth < self.max_depth // 2:
-                    # For shallow depths, still create edges for structural deps
-                    # This helps build a more complete causal picture
-                    is_causal = True
-                    score = 0.3  # Lower score for structural-only dependency
-                    examples = [{
-                        "type": "structural",
-                        "reason": "RTL dependency exists but counterfactual not conclusive"
-                    }]
-                else:
-                    # For deeper levels, skip to avoid graph explosion
-                    continue
+                score = 0.3
+                examples = [{
+                    "type": "structural",
+                    "reason": "RTL dependency exists but counterfactual not conclusive"
+                }]
+
+            if weak_candidate and (
+                self.stats["weak_edges_admitted"] >= self.weak_edge_budget
+                or weak_edges_for_target >= self.weak_beam_width
+            ):
+                self.stats["rejected_candidates"] += 1
+                continue
             
             # Determine contribution type
             if dep.dep_type == DependencyType.SEQUENTIAL:
@@ -1223,9 +1288,15 @@ class BackwardSlicer:
                 change_examples=examples
             )
             
-            self.edges.append(edge)
-            self._edge_set.add(edge_key)  # Track edge to prevent duplicates
-            self.stats["edges_created"] += 1
+            committed_parent = self._commit_candidate(
+                parent_node, parent_is_new, edge
+            )
+            if committed_parent is None:
+                continue
+            parent_node = committed_parent
+            if weak_candidate:
+                weak_edges_for_target += 1
+                self.stats["weak_edges_admitted"] += 1
             
             # Update parent node suspect score
             parent_node.suspect_score = max(parent_node.suspect_score, score * 0.9)
@@ -1347,17 +1418,7 @@ class BackwardSlicer:
         self.edges = []
         self.visited = set()
         self._edge_set = set()  # Track edges to prevent duplicates
-        self.stats = {
-            "nodes_created": 0,
-            "edges_created": 0,
-            "max_depth_reached": False,
-            "max_nodes_reached": False,
-            "undetermined_nodes": 0,
-            "sva_trigger_cycle": None,
-            "sva_time_window": None,
-            "sva_window_end_cycle": None,
-            "sva_consequent_signals": None
-        }
+        self.stats = self._new_stats()
         
         original_endpoint_cycle = endpoint_cycle  # This is the failure cycle
         hierarchy = self._extract_module_hierarchy(endpoint_signal)

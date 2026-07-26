@@ -366,6 +366,15 @@ def validate_graph_v2(graph: Mapping[str, Any]) -> Dict[str, Any]:
         node_ids.add(node["node_id"])
         if node["identity_strength"] not in IDENTITY_STRENGTHS:
             raise ContractError("node identity_strength is invalid")
+        if (
+            isinstance(node["depth"], bool)
+            or not isinstance(node["depth"], int)
+            or node["depth"] < 0
+            or node["depth"] > graph["bounds"]["max_depth"]
+        ):
+            raise ContractError(
+                "graph node depth must be within graph.bounds.max_depth"
+            )
         if not 0 <= float(node["suspect_score"]) <= 1:
             raise ContractError("node suspect_score must be in [0, 1]")
     edge_ids = set()

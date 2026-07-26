@@ -253,6 +253,7 @@ def _convert_graph(
 
     max_depth_reached = bool(stats.get("max_depth_reached"))
     max_nodes_reached = bool(stats.get("max_nodes_reached"))
+    max_work_reached = bool(stats.get("candidate_evaluation_budget_reached"))
     for ambiguity in stats.get("identity_ambiguities") or []:
         diagnostics.append(
             _diagnostic(
@@ -276,6 +277,17 @@ def _convert_graph(
             _diagnostic(
                 "graph_max_nodes_reached",
                 f"causal slice reached max_nodes={request.max_nodes}",
+            )
+        )
+    if max_work_reached:
+        diagnostics.append(
+            _diagnostic(
+                "graph_max_work_reached",
+                (
+                    "causal slice reached deterministic "
+                    f"candidate_evaluation_budget="
+                    f"{stats.get('candidate_evaluation_budget')}"
+                ),
             )
         )
     return {
