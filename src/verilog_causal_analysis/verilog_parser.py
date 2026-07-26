@@ -19,7 +19,7 @@ import re
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Set, Tuple, Optional, Any
+from typing import Dict, Iterable, List, Mapping, Set, Tuple, Optional, Any
 from enum import Enum
 
 from hdlConvertor import HdlConvertor
@@ -59,12 +59,11 @@ class SignalInfo:
         return hash((self.name, self.module_name))
 
 
-@dataclass
-class Dependency:
-    """Dependency relationship between two signals."""
-    source: str
-    target: str
-    dep_type: DependencyType
+@dataclass(frozen=True, slots=True)
+class StatementEvidence:
+    """Evidence shared by every source arc of one RTL statement."""
+
+    statement_id: str
     expression: str = ""
     file_path: str = ""
     line_start: int = 0
@@ -72,11 +71,137 @@ class Dependency:
     code_snippet: str = ""
     condition: str = ""
     module_name: str = ""
-    source_qualified: str = ""
+    target: str = ""
     target_qualified: str = ""
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        expression: str = "",
+        file_path: str = "",
+        line_start: int = 0,
+        line_end: int = 0,
+        code_snippet: str = "",
+        condition: str = "",
+        module_name: str = "",
+        target: str = "",
+        target_qualified: str = "",
+    ) -> "StatementEvidence":
+        identity = "\x1f".join(
+            (
+                module_name,
+                target_qualified or target,
+                str(line_start),
+                str(line_end),
+                expression,
+                condition,
+                code_snippet,
+            )
+        )
+        return cls(
+            statement_id=(
+                "vcs_"
+                + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+            ),
+            expression=expression,
+            file_path=file_path,
+            line_start=line_start,
+            line_end=line_end,
+            code_snippet=code_snippet,
+            condition=condition,
+            module_name=module_name,
+            target=target,
+            target_qualified=target_qualified,
+        )
+
+
+@dataclass(init=False, slots=True)
+class Dependency:
+    """Compact source/target arc referencing shared statement evidence.
+
+    The constructor intentionally preserves the historical ``Dependency``
+    keyword surface. Parser-owned dependencies intern ``statement`` objects so
+    a high-fan-in assignment stores expression, condition, snippet, and source
+    location once rather than once per source arc.
+    """
+
+    source: str
+    target: str
+    dep_type: DependencyType
+    source_qualified: str
+    target_qualified: str
+    statement: StatementEvidence
+
+    def __init__(
+        self,
+        source: str,
+        target: str,
+        dep_type: DependencyType,
+        expression: str = "",
+        file_path: str = "",
+        line_start: int = 0,
+        line_end: int = 0,
+        code_snippet: str = "",
+        condition: str = "",
+        module_name: str = "",
+        source_qualified: str = "",
+        target_qualified: str = "",
+        *,
+        statement: Optional[StatementEvidence] = None,
+    ):
+        self.source = source
+        self.target = target
+        self.dep_type = dep_type
+        self.source_qualified = source_qualified
+        self.target_qualified = target_qualified
+        self.statement = statement or StatementEvidence.create(
+            expression=expression,
+            file_path=file_path,
+            line_start=line_start,
+            line_end=line_end,
+            code_snippet=code_snippet,
+            condition=condition,
+            module_name=module_name,
+            target=target,
+            target_qualified=target_qualified,
+        )
+
+    @property
+    def statement_id(self) -> str:
+        return self.statement.statement_id
+
+    @property
+    def expression(self) -> str:
+        return self.statement.expression
+
+    @property
+    def file_path(self) -> str:
+        return self.statement.file_path
+
+    @property
+    def line_start(self) -> int:
+        return self.statement.line_start
+
+    @property
+    def line_end(self) -> int:
+        return self.statement.line_end
+
+    @property
+    def code_snippet(self) -> str:
+        return self.statement.code_snippet
+
+    @property
+    def condition(self) -> str:
+        return self.statement.condition
+
+    @property
+    def module_name(self) -> str:
+        return self.statement.module_name
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "statement_id": self.statement_id,
             "source": self.source,
             "target": self.target,
             "source_qualified": self.source_qualified,
@@ -302,6 +427,7 @@ class VerilogParser:
         self.all_dependencies: List[Dependency] = []
         self._dependency_index = DependencyIndex()
         self._dependency_index_size = 0
+        self._statement_evidence: Dict[str, StatementEvidence] = {}
         self._rtl_context_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self.instance_module_map: Dict[str, Set[str]] = {}
         self.file_contents: Dict[str, str] = {}
@@ -482,10 +608,8 @@ class VerilogParser:
         condition: str = "",
     ) -> Dependency:
         """Create a dependency with both short and module-qualified names."""
-        return Dependency(
-            source=source,
-            target=target,
-            dep_type=dep_type,
+        target_qualified = self._qualify_signal(module, target)
+        statement = StatementEvidence.create(
             expression=expression,
             file_path=file_path,
             line_start=line_start,
@@ -493,8 +617,19 @@ class VerilogParser:
             code_snippet=code_snippet,
             condition=condition,
             module_name=module.name,
+            target=target,
+            target_qualified=target_qualified,
+        )
+        statement = self._statement_evidence.setdefault(
+            statement.statement_id, statement
+        )
+        return Dependency(
+            source=source,
+            target=target,
+            dep_type=dep_type,
             source_qualified=self._qualify_signal(module, source),
-            target_qualified=self._qualify_signal(module, target),
+            target_qualified=target_qualified,
+            statement=statement,
         )
 
     def _add_dependency(self, module: ModuleInfo, dep: Dependency) -> None:
@@ -803,231 +938,594 @@ class VerilogParser:
                     condition, condition_sources
                 )
     
-    def parse_file(self, file_path: str) -> List[ModuleInfo]:
-        """
-        Parse a Verilog/SystemVerilog file.
-        
-        Args:
-            file_path: Path to file
-            
-        Returns:
-            List of ModuleInfo for each module
-        """
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"File not found: {file_path}")
-        
-        # Read and sanitize file content for parsing/snippets
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            original_content = f.read()
-        sanitized_content = self._sanitize_verilog_content(original_content)
-        content = sanitized_content
+    @staticmethod
+    def _module_name(obj: HdlModuleDef) -> str:
+        return (
+            obj.module_name.val
+            if hasattr(obj.module_name, "val")
+            else str(obj.module_name)
+        )
 
-        self.file_contents[file_path] = content
-        self.file_lines[file_path] = content.split('\n')
-
-        parse_path = file_path
-        temp_path = None
-        if sanitized_content != original_content:
-            # Write a temporary sanitized copy to keep parser happy while
-            # preserving original file paths in the metadata we emit.
-            fd, temp_path = tempfile.mkstemp(
-                suffix=os.path.splitext(file_path)[1],
-                dir=os.path.dirname(file_path)
+    def _module_source_map(
+        self,
+        module_names: Iterable[str],
+        file_paths: List[str],
+    ) -> Dict[str, str]:
+        """Map parsed modules back to their verified source artifacts."""
+        result: Dict[str, str] = {}
+        for module_name in module_names:
+            pattern = re.compile(
+                rf"\bmodule\s+(?:automatic\s+)?{re.escape(module_name)}\b"
             )
-            with os.fdopen(fd, 'w', encoding='utf-8') as tmp:
-                tmp.write(sanitized_content)
-            parse_path = temp_path
-        
-        # Determine language
-        lang = Language.SYSTEM_VERILOG if file_path.endswith('.sv') else Language.VERILOG
-        
-        # Parse with hdlConvertor
+            matches = [
+                path
+                for path in file_paths
+                if pattern.search(self.file_contents[path])
+            ]
+            if len(matches) == 1:
+                result[module_name] = matches[0]
+            elif len(file_paths) == 1:
+                result[module_name] = file_paths[0]
+            else:
+                raise RuntimeError(
+                    "Could not bind parsed module to exactly one required RTL "
+                    f"artifact: {module_name}"
+                )
+        return result
+
+    def _make_module_shell(
+        self,
+        obj: HdlModuleDef,
+        file_path: str,
+    ) -> ModuleInfo:
+        """Collect declarations before extracting any dependency arcs."""
+        module_name = self._module_name(obj)
+        line_start, line_end = (
+            self._get_position(obj.dec) if obj.dec else (0, 0)
+        )
+        module = ModuleInfo(
+            name=module_name,
+            file_path=file_path,
+            line_start=line_start,
+            line_end=line_end,
+        )
+        if obj.dec and hasattr(obj.dec, "ports"):
+            for port in obj.dec.ports:
+                port_name = (
+                    port.name.val
+                    if hasattr(port.name, "val")
+                    else str(port.name)
+                )
+                direction = str(port.direction).split(".")[-1].lower()
+                port_line, _ = self._get_position(port)
+                signal = SignalInfo(
+                    name=port_name,
+                    signal_type=direction,
+                    width=self._get_width_from_type(port.type),
+                    defined_in_file=file_path,
+                    defined_at_line=port_line,
+                    module_name=module_name,
+                )
+                module.ports[port_name] = signal
+                module.signals[port_name] = signal
+        return module
+
+    def _populate_module(
+        self,
+        obj: HdlModuleDef,
+        module: ModuleInfo,
+        file_path: str,
+    ) -> None:
+        """Extract statements after the complete module registry exists."""
+        for body_obj in obj.objs:
+            if isinstance(body_obj, HdlIdDef):
+                sig_name = (
+                    body_obj.name.val
+                    if hasattr(body_obj.name, "val")
+                    else str(body_obj.name)
+                )
+                sig_type = (
+                    "reg"
+                    if body_obj.direction == HdlDirection.INTERNAL
+                    else "wire"
+                )
+                sig_line, _ = self._get_position(body_obj)
+                signal = SignalInfo(
+                    name=sig_name,
+                    signal_type=sig_type,
+                    width=self._get_width_from_type(body_obj.type),
+                    defined_in_file=file_path,
+                    defined_at_line=sig_line,
+                    module_name=module.name,
+                )
+                module.signals[sig_name] = signal
+                if body_obj.value is not None:
+                    sources = self._extract_signals_from_expr(body_obj.value)
+                    expression = self._expr_to_string(body_obj.value)
+                    for source in sorted(sources):
+                        if source != sig_name:
+                            self._add_dependency(
+                                module,
+                                self._make_dependency(
+                                    module=module,
+                                    source=source,
+                                    target=sig_name,
+                                    dep_type=DependencyType.COMBINATIONAL,
+                                    expression=expression,
+                                    file_path=file_path,
+                                    line_start=sig_line,
+                                    line_end=sig_line,
+                                    code_snippet=self._get_code_snippet(
+                                        file_path, sig_line, sig_line
+                                    ),
+                                ),
+                            )
+            elif isinstance(body_obj, HdlStmProcess):
+                self._process_statement(
+                    body_obj.body,
+                    module,
+                    file_path,
+                    self._is_sequential_process(body_obj),
+                )
+            elif isinstance(body_obj, HdlStmAssign):
+                self._process_assignment(
+                    body_obj,
+                    module,
+                    file_path,
+                    is_sequential=False,
+                )
+            elif isinstance(body_obj, HdlCompInst):
+                inst_name = str(
+                    getattr(body_obj.name, "val", body_obj.name)
+                )
+                mod_name = str(
+                    getattr(
+                        body_obj.module_name,
+                        "val",
+                        body_obj.module_name,
+                    )
+                )
+                inst_line, _ = self._get_position(body_obj)
+                module.submodule_instances.append(
+                    (inst_name, mod_name, inst_line)
+                )
+                self.instance_module_map.setdefault(
+                    inst_name, set()
+                ).add(mod_name)
+                for port_conn in getattr(body_obj, "port_map", ()) or ():
+                    if not isinstance(port_conn, HdlOp) or len(
+                        port_conn.ops
+                    ) < 2:
+                        continue
+                    port_name = self._get_signal_name(port_conn.ops[0])
+                    connected_signal = self._get_signal_name(
+                        port_conn.ops[1]
+                    )
+                    if not port_name or not connected_signal:
+                        continue
+                    inst_port = f"{inst_name}.{port_name}"
+                    direction = self._get_port_direction(
+                        mod_name, port_name
+                    )
+                    if self._is_input_direction(direction):
+                        port_deps = [
+                            (
+                                connected_signal,
+                                inst_port,
+                                DependencyType.PORT_INPUT,
+                            )
+                        ]
+                    elif self._is_output_direction(direction):
+                        port_deps = [
+                            (
+                                inst_port,
+                                connected_signal,
+                                DependencyType.PORT_OUTPUT,
+                            )
+                        ]
+                    else:
+                        port_deps = [
+                            (
+                                connected_signal,
+                                inst_port,
+                                DependencyType.PORT_INPUT,
+                            ),
+                            (
+                                inst_port,
+                                connected_signal,
+                                DependencyType.PORT_OUTPUT,
+                            ),
+                        ]
+                    for source, target, dep_type in port_deps:
+                        self._add_dependency(
+                            module,
+                            self._make_dependency(
+                                module=module,
+                                source=source,
+                                target=target,
+                                dep_type=dep_type,
+                                expression=(
+                                    f".{port_name}({connected_signal})"
+                                ),
+                                file_path=file_path,
+                                line_start=inst_line,
+                                line_end=inst_line,
+                                code_snippet=self._get_code_snippet(
+                                    file_path, inst_line, inst_line
+                                ),
+                            ),
+                        )
+
+    def _parse_file_set(self, file_paths: List[str]) -> List[ModuleInfo]:
+        """Parse a canonical RTL closure once, then extract in two phases."""
+        canonical_paths = sorted(dict.fromkeys(file_paths))
+        if not canonical_paths:
+            return []
+
+        parse_paths: List[str] = []
+        temporary_paths: List[str] = []
+        for file_path in canonical_paths:
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"File not found: {file_path}")
+            with open(
+                file_path,
+                "r",
+                encoding="utf-8",
+                errors="ignore",
+            ) as source:
+                original_content = source.read()
+            content = self._sanitize_verilog_content(original_content)
+            self.file_contents[file_path] = content
+            self.file_lines[file_path] = content.split("\n")
+            if content == original_content:
+                parse_paths.append(file_path)
+                continue
+            descriptor, temporary_path = tempfile.mkstemp(
+                suffix=os.path.splitext(file_path)[1],
+                dir=os.path.dirname(file_path),
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+                temporary.write(content)
+            parse_paths.append(temporary_path)
+            temporary_paths.append(temporary_path)
+
+        language = (
+            Language.SYSTEM_VERILOG
+            if any(path.endswith(".sv") for path in canonical_paths)
+            else Language.VERILOG
+        )
+        include_dirs = sorted(
+            {os.path.dirname(path) for path in canonical_paths}
+        )
         try:
-            context = self.converter.parse([parse_path], lang, [os.path.dirname(file_path)], debug=False)
-        except Exception as e:
+            context = self.converter.parse(
+                parse_paths,
+                language,
+                include_dirs,
+                debug=False,
+            )
+        except Exception as error:
             diagnostic = {
                 "code": "rtl_parse_failed",
                 "severity": "error",
                 "breaks_complete": True,
-                "file_path": file_path,
-                "message": str(e),
+                "file_path": canonical_paths[0],
+                "message": str(error),
             }
             self.diagnostics.append(diagnostic)
             if self.strict:
-                raise RuntimeError(f"Failed to parse {file_path}: {e}") from e
-            print(f"Warning: Failed to parse {file_path}: {e}")
+                raise RuntimeError(
+                    "Failed to parse required RTL closure: "
+                    f"{type(error).__name__}"
+                ) from error
+            print(f"Warning: Failed to parse RTL closure: {error}")
             return []
         finally:
-            if temp_path and os.path.exists(temp_path):
+            for temporary_path in temporary_paths:
                 try:
-                    os.remove(temp_path)
+                    os.remove(temporary_path)
                 except OSError:
                     pass
-        
-        modules = []
-        
-        for obj in context.objs:
-            if isinstance(obj, HdlModuleDef):
-                module_name = obj.module_name.val if hasattr(obj.module_name, 'val') else str(obj.module_name)
-                
-                # Get position
-                line_start, line_end = self._get_position(obj.dec) if obj.dec else (0, 0)
-                
-                module = ModuleInfo(
-                    name=module_name,
-                    file_path=file_path,
-                    line_start=line_start,
-                    line_end=line_end
-                )
-                
-                # Extract ports
-                if obj.dec and hasattr(obj.dec, 'ports'):
-                    for port in obj.dec.ports:
-                        port_name = port.name.val if hasattr(port.name, 'val') else str(port.name)
-                        direction = str(port.direction).split('.')[-1].lower()
-                        width = self._get_width_from_type(port.type)
-                        
-                        port_line, _ = self._get_position(port)
-                        
-                        sig = SignalInfo(
-                            name=port_name,
-                            signal_type=direction,
-                            width=width,
-                            defined_in_file=file_path,
-                            defined_at_line=port_line,
-                            module_name=module_name
-                        )
-                        module.ports[port_name] = sig
-                        module.signals[port_name] = sig
-                
-                # Process body
-                for body_obj in obj.objs:
-                    if isinstance(body_obj, HdlIdDef):
-                        # Signal declaration
-                        sig_name = body_obj.name.val if hasattr(body_obj.name, 'val') else str(body_obj.name)
-                        sig_type = "reg" if body_obj.direction == HdlDirection.INTERNAL else "wire"
-                        width = self._get_width_from_type(body_obj.type)
-                        
-                        sig_line, _ = self._get_position(body_obj)
-                        
-                        sig = SignalInfo(
-                            name=sig_name,
-                            signal_type=sig_type,
-                            width=width,
-                            defined_in_file=file_path,
-                            defined_at_line=sig_line,
-                            module_name=module_name
-                        )
-                        module.signals[sig_name] = sig
-                        
-                        # Handle wire/reg declarations with initialization expressions
-                        # e.g., wire _eating_count_T = _ph0_io_out == 2'h2;
-                        if body_obj.value is not None:
-                            sources = self._extract_signals_from_expr(body_obj.value)
-                            expr_str = self._expr_to_string(body_obj.value)
-                            
-                            for source in sorted(sources):
-                                if source != sig_name:
-                                    dep = self._make_dependency(
-                                        module=module,
-                                        source=source,
-                                        target=sig_name,
-                                        dep_type=DependencyType.COMBINATIONAL,
-                                        expression=expr_str,
-                                        file_path=file_path,
-                                        line_start=sig_line,
-                                        line_end=sig_line,
-                                        code_snippet=self._get_code_snippet(file_path, sig_line, sig_line)
-                                    )
-                                    self._add_dependency(module, dep)
-                    
-                    elif isinstance(body_obj, HdlStmProcess):
-                        # Always block
-                        is_seq = self._is_sequential_process(body_obj)
-                        self._process_statement(body_obj.body, module, file_path, is_seq)
-                    
-                    elif isinstance(body_obj, HdlStmAssign):
-                        # Continuous assignment
-                        self._process_assignment(body_obj, module, file_path, is_sequential=False)
-                    
-                    elif isinstance(body_obj, HdlCompInst):
-                        # Module instantiation
-                        inst_name = str(getattr(body_obj.name, 'val', body_obj.name))
-                        mod_name = str(getattr(body_obj.module_name, 'val', body_obj.module_name))
-                        inst_line, _ = self._get_position(body_obj)
-                        module.submodule_instances.append((inst_name, mod_name, inst_line))
-                        self.instance_module_map.setdefault(inst_name, set()).add(mod_name)
-                        
-                        # Process port connections to extract dependencies
-                        # For output ports: submodule.io_out -> connected_wire
-                        if hasattr(body_obj, 'port_map') and body_obj.port_map:
-                            for port_conn in body_obj.port_map:
-                                # Port connection: (port_name, connected_signal)
-                                if isinstance(port_conn, HdlOp):
-                                    # Named port connection: .port_name(signal)
-                                    port_name = None
-                                    connected_signal = None
-                                    if len(port_conn.ops) >= 2:
-                                        port_name = self._get_signal_name(port_conn.ops[0])
-                                        connected_signal = self._get_signal_name(port_conn.ops[1])
-                                    
-                                    if port_name and connected_signal:
-                                        # Create direction-aware hierarchical dependency:
-                                        # - input ports:  parent signal -> child instance port
-                                        # - output ports: child instance port -> parent signal
-                                        inst_port = f"{inst_name}.{port_name}"
-                                        direction = self._get_port_direction(mod_name, port_name)
-                                        port_deps: List[Tuple[str, str, DependencyType]] = []
-                                        if self._is_input_direction(direction):
-                                            port_deps.append((connected_signal, inst_port, DependencyType.PORT_INPUT))
-                                        elif self._is_output_direction(direction):
-                                            port_deps.append((inst_port, connected_signal, DependencyType.PORT_OUTPUT))
-                                        else:
-                                            # Unknown or inout: keep both directions so downstream waveform
-                                            # evidence can disambiguate rather than dropping a possible cause.
-                                            port_deps.append((connected_signal, inst_port, DependencyType.PORT_INPUT))
-                                            port_deps.append((inst_port, connected_signal, DependencyType.PORT_OUTPUT))
 
-                                        for source, target, dep_type in port_deps:
-                                            dep = self._make_dependency(
-                                                module=module,
-                                                source=source,
-                                                target=target,
-                                                dep_type=dep_type,
-                                                expression=f".{port_name}({connected_signal})",
-                                                file_path=file_path,
-                                                line_start=inst_line,
-                                                line_end=inst_line,
-                                                code_snippet=self._get_code_snippet(file_path, inst_line, inst_line)
-                                            )
-                                            self._add_dependency(module, dep)
-                
-                modules.append(module)
-                self.modules[module_name] = module
-                
-                # Add to global registry
-                for sig_name, sig in module.signals.items():
-                    full_name = f"{module_name}.{sig_name}"
-                    self.all_signals[full_name] = sig
-        
-        # Parse SVA assertions (hdlConvertor may skip these)
-        self._parse_sva_assertions(file_path, modules)
+        module_defs = [
+            obj for obj in context.objs if isinstance(obj, HdlModuleDef)
+        ]
+        source_by_module = self._module_source_map(
+            (self._module_name(obj) for obj in module_defs),
+            canonical_paths,
+        )
+        modules: List[ModuleInfo] = []
+
+        # Phase 1: make every port direction visible to every parent.
+        for obj in module_defs:
+            module_name = self._module_name(obj)
+            if module_name in self.modules:
+                raise RuntimeError(
+                    f"Duplicate parsed module definition: {module_name}"
+                )
+            module = self._make_module_shell(
+                obj, source_by_module[module_name]
+            )
+            self.modules[module_name] = module
+            modules.append(module)
+            for signal_name, signal in module.signals.items():
+                self.all_signals[f"{module_name}.{signal_name}"] = signal
+
+        # Phase 2: dependencies may now consult the complete registry.
+        for obj in module_defs:
+            module_name = self._module_name(obj)
+            module = self.modules[module_name]
+            self._populate_module(
+                obj, module, source_by_module[module_name]
+            )
+            for signal_name, signal in module.signals.items():
+                self.all_signals[f"{module_name}.{signal_name}"] = signal
+
+        modules_by_path: Dict[str, List[ModuleInfo]] = defaultdict(list)
+        for module in modules:
+            modules_by_path[module.file_path].append(module)
+        for file_path in canonical_paths:
+            self._parse_sva_assertions(
+                file_path, modules_by_path.get(file_path, [])
+            )
         self._rtl_context_cache.clear()
 
         if self.strict and not modules:
-            diagnostic = {
-                "code": "rtl_parse_failed",
-                "severity": "error",
-                "breaks_complete": True,
-                "file_path": file_path,
-                "message": "required RTL file produced no module definitions",
-            }
-            self.diagnostics.append(diagnostic)
-            raise RuntimeError(
-                f"Required RTL file produced no module definitions: {file_path}"
+            self.diagnostics.append(
+                {
+                    "code": "rtl_parse_failed",
+                    "severity": "error",
+                    "breaks_complete": True,
+                    "file_path": canonical_paths[0],
+                    "message": (
+                        "required RTL closure produced no module definitions"
+                    ),
+                }
             )
-        
+            raise RuntimeError(
+                "Required RTL closure produced no module definitions"
+            )
         return modules
+
+    def parse_file(self, file_path: str) -> List[ModuleInfo]:
+        """Parse one file through the same two-phase frontend."""
+        return self._parse_file_set([file_path])
+
+    def parse_files_strict(
+        self,
+        file_paths: Iterable[str],
+    ) -> Dict[str, ModuleInfo]:
+        """Parse the complete required closure in one hdlConvertor call."""
+        self._parse_file_set(list(file_paths))
+        return self.modules
+
+    def to_prepared_design(
+        self,
+        artifact_by_path: Mapping[str, str],
+    ) -> Dict[str, Any]:
+        """Serialize parsed state without local paths or parser AST objects."""
+        normalized_artifacts = {
+            os.path.abspath(path): artifact_id
+            for path, artifact_id in artifact_by_path.items()
+        }
+
+        def artifact_id(path: str) -> str:
+            try:
+                return normalized_artifacts[os.path.abspath(path)]
+            except KeyError as error:
+                raise ValueError(
+                    "parsed design references an unbound RTL path"
+                ) from error
+
+        modules = []
+        for module_name in sorted(self.modules):
+            module = self.modules[module_name]
+            signals = []
+            for signal_name in sorted(module.signals):
+                signal = module.signals[signal_name]
+                signals.append(
+                    {
+                        "name": signal.name,
+                        "signal_type": signal.signal_type,
+                        "width": signal.width,
+                        "is_array": signal.is_array,
+                        "array_size": signal.array_size,
+                        "artifact_id": artifact_id(
+                            signal.defined_in_file
+                        ),
+                        "defined_at_line": signal.defined_at_line,
+                        "module_name": signal.module_name,
+                    }
+                )
+            modules.append(
+                {
+                    "name": module.name,
+                    "artifact_id": artifact_id(module.file_path),
+                    "line_start": module.line_start,
+                    "line_end": module.line_end,
+                    "ports": sorted(module.ports),
+                    "signals": signals,
+                    "submodule_instances": [
+                        list(row)
+                        for row in sorted(module.submodule_instances)
+                    ],
+                }
+            )
+
+        statements: Dict[str, Dict[str, Any]] = {}
+        dependencies = []
+        for dependency in self.all_dependencies:
+            statements.setdefault(
+                dependency.statement_id,
+                {
+                    "statement_id": dependency.statement_id,
+                    "expression": dependency.expression,
+                    "artifact_id": artifact_id(dependency.file_path),
+                    "line_start": dependency.line_start,
+                    "line_end": dependency.line_end,
+                    "code_snippet": dependency.code_snippet,
+                    "condition": dependency.condition,
+                    "module_name": dependency.module_name,
+                    "target": dependency.target,
+                    "target_qualified": dependency.target_qualified,
+                },
+            )
+            dependencies.append(
+                {
+                    "statement_id": dependency.statement_id,
+                    "source": dependency.source,
+                    "target": dependency.target,
+                    "dep_type": dependency.dep_type.value,
+                    "source_qualified": dependency.source_qualified,
+                    "target_qualified": dependency.target_qualified,
+                }
+            )
+        return {
+            "schema_version": "parsed_design_cache.v2",
+            "modules": modules,
+            "statements": [
+                statements[statement_id]
+                for statement_id in sorted(statements)
+            ],
+            "dependencies": dependencies,
+        }
+
+    @classmethod
+    def from_prepared_design(
+        cls,
+        payload: Mapping[str, Any],
+        artifact_paths: Mapping[str, str],
+        *,
+        strict: bool = True,
+    ) -> "VerilogParser":
+        """Restore a validated path-free prepared-design payload."""
+        if payload.get("schema_version") != "parsed_design_cache.v2":
+            raise ValueError("unsupported parsed-design cache schema")
+        parser = cls(strict=strict)
+
+        def source_path(artifact_id: str) -> str:
+            try:
+                return artifact_paths[artifact_id]
+            except KeyError as error:
+                raise ValueError(
+                    "parsed-design cache references unknown artifact"
+                ) from error
+
+        for module_row in payload.get("modules", []):
+            module = ModuleInfo(
+                name=str(module_row["name"]),
+                file_path=source_path(str(module_row["artifact_id"])),
+                line_start=int(module_row["line_start"]),
+                line_end=int(module_row["line_end"]),
+                submodule_instances=[
+                    (str(row[0]), str(row[1]), int(row[2]))
+                    for row in module_row.get(
+                        "submodule_instances", []
+                    )
+                ],
+            )
+            for signal_row in module_row.get("signals", []):
+                signal = SignalInfo(
+                    name=str(signal_row["name"]),
+                    signal_type=str(signal_row["signal_type"]),
+                    width=int(signal_row["width"]),
+                    is_array=bool(signal_row["is_array"]),
+                    array_size=int(signal_row["array_size"]),
+                    defined_in_file=source_path(
+                        str(signal_row["artifact_id"])
+                    ),
+                    defined_at_line=int(
+                        signal_row["defined_at_line"]
+                    ),
+                    module_name=str(signal_row["module_name"]),
+                )
+                module.signals[signal.name] = signal
+                parser.all_signals[
+                    f"{module.name}.{signal.name}"
+                ] = signal
+            for port_name in module_row.get("ports", []):
+                if port_name not in module.signals:
+                    raise ValueError(
+                        "parsed-design cache port is not a signal"
+                    )
+                module.ports[str(port_name)] = module.signals[
+                    str(port_name)
+                ]
+            parser.modules[module.name] = module
+            for instance_name, child_module, _line in (
+                module.submodule_instances
+            ):
+                parser.instance_module_map.setdefault(
+                    instance_name, set()
+                ).add(child_module)
+
+        statements: Dict[str, StatementEvidence] = {}
+        for statement_row in payload.get("statements", []):
+            statement_id = str(statement_row["statement_id"])
+            statement = StatementEvidence(
+                statement_id=statement_id,
+                expression=str(statement_row["expression"]),
+                file_path=source_path(str(statement_row["artifact_id"])),
+                line_start=int(statement_row["line_start"]),
+                line_end=int(statement_row["line_end"]),
+                code_snippet=str(statement_row["code_snippet"]),
+                condition=str(statement_row["condition"]),
+                module_name=str(statement_row["module_name"]),
+                target=str(statement_row["target"]),
+                target_qualified=str(statement_row["target_qualified"]),
+            )
+            if (
+                StatementEvidence.create(
+                    expression=statement.expression,
+                    file_path=statement.file_path,
+                    line_start=statement.line_start,
+                    line_end=statement.line_end,
+                    code_snippet=statement.code_snippet,
+                    condition=statement.condition,
+                    module_name=statement.module_name,
+                    target=statement.target,
+                    target_qualified=statement.target_qualified,
+                ).statement_id
+                != statement_id
+            ):
+                raise ValueError("parsed-design statement identity mismatch")
+            if statement_id in statements:
+                raise ValueError("duplicate parsed-design statement ID")
+            statements[statement_id] = statement
+
+        for dependency_row in payload.get("dependencies", []):
+            statement_id = str(dependency_row["statement_id"])
+            try:
+                statement = statements[statement_id]
+            except KeyError as error:
+                raise ValueError(
+                    "parsed-design dependency references unknown statement"
+                ) from error
+            module_name = statement.module_name
+            if module_name not in parser.modules:
+                raise ValueError(
+                    "parsed-design dependency references unknown module"
+                )
+            dependency = Dependency(
+                source=str(dependency_row["source"]),
+                target=str(dependency_row["target"]),
+                dep_type=DependencyType(
+                    str(dependency_row["dep_type"])
+                ),
+                source_qualified=str(
+                    dependency_row["source_qualified"]
+                ),
+                target_qualified=str(
+                    dependency_row["target_qualified"]
+                ),
+                statement=statement,
+            )
+            parser._statement_evidence[statement_id] = statement
+            parser._add_dependency(
+                parser.modules[module_name], dependency
+            )
+        parser.rebuild_dependency_index()
+        return parser
     
     @staticmethod
     def _find_matching_paren(text: str, open_idx: int) -> int:
@@ -1210,12 +1708,13 @@ class VerilogParser:
                 self._add_dependency(target_module, dep)
     
     def parse_files(self, file_paths: List[str]) -> Dict[str, ModuleInfo]:
-        """Parse multiple files."""
-        for file_path in file_paths:
-            try:
-                self.parse_file(file_path)
-            except Exception as e:
-                print(f"Warning: Failed to parse {file_path}: {e}")
+        """Parse multiple files with one closure-level frontend invocation."""
+        try:
+            self._parse_file_set(file_paths)
+        except Exception as error:
+            if self.strict:
+                raise
+            print(f"Warning: Failed to parse RTL closure: {error}")
         return self.modules
     
     def _dependency_matches_target(

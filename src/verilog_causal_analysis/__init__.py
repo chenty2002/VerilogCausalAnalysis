@@ -23,14 +23,17 @@ from .identity import (
     sha256_file,
 )
 from .query import (
+    GraphQueryView,
     QueryError,
     expand_predecessors,
     get_edge_evidence,
     get_overview,
+    get_query_cache_statistics,
     get_ranked_paths,
+    prepare_query_view,
 )
 
-__version__ = "2.1.0"
+__version__ = "2.3.0"
 
 
 def build_causal_graph_v2(request):
@@ -39,6 +42,14 @@ def build_causal_graph_v2(request):
 
     return _build(request)
 
+
+def prepare_causal_analysis(request):
+    """Prepare verified RTL/waveform state for multiple V2 graph builds."""
+    from .engine import prepare_causal_analysis as _prepare
+
+    return _prepare(request)
+
+
 __all__ = [
     "ANALYZER_REVISION",
     "CausalAnalysisRequestV2",
@@ -46,6 +57,7 @@ __all__ = [
     "EVIDENCE_STRENGTHS",
     "GRAPH_SCHEMA",
     "GRAPH_STATUSES",
+    "GraphQueryView",
     "HDLCONVERTOR_REVISION",
     "IDENTITY_STRENGTHS",
     "QueryError",
@@ -56,8 +68,11 @@ __all__ = [
     "expand_predecessors",
     "get_edge_evidence",
     "get_overview",
+    "get_query_cache_statistics",
     "get_ranked_paths",
     "make_request_v2",
+    "prepare_causal_analysis",
+    "prepare_query_view",
     "sha256_file",
     "validate_graph_v2",
     "__version__",

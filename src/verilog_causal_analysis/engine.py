@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import tempfile
+from collections import OrderedDict
+from pathlib import Path
+from threading import RLock
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from .causal_slicer import BackwardSlicer
@@ -13,6 +18,7 @@ from .identity import (
     ANALYZER_REVISION,
     HDLCONVERTOR_REVISION,
     canonical_sha256,
+    contains_absolute_path,
     sha256_file,
     stable_id,
     stable_set_sha256,
@@ -23,10 +29,28 @@ from .verilog_parser import VerilogParser
 _ABSOLUTE_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9_.-])/(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+"
 )
+_PARSED_DESIGN_CACHE_MAX = 8
+_PARSED_DESIGN_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_PARSED_DESIGN_CACHE_LOCK = RLock()
 
 
 def _redact_absolute_paths(text: str) -> str:
     return _ABSOLUTE_PATH_RE.sub("<redacted-path>", text)
+
+
+def _contains_absolute_path_fragment(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(_ABSOLUTE_PATH_RE.search(value))
+    if isinstance(value, Mapping):
+        return any(
+            _contains_absolute_path_fragment(item)
+            for item in value.values()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(
+            _contains_absolute_path_fragment(item) for item in value
+        )
+    return False
 
 
 def _diagnostic(
@@ -254,6 +278,9 @@ def _convert_graph(
     max_depth_reached = bool(stats.get("max_depth_reached"))
     max_nodes_reached = bool(stats.get("max_nodes_reached"))
     max_work_reached = bool(stats.get("candidate_evaluation_budget_reached"))
+    temporal_work_reached = bool(
+        stats.get("temporal_work_budget_reached")
+    )
     for ambiguity in stats.get("identity_ambiguities") or []:
         diagnostics.append(
             _diagnostic(
@@ -287,6 +314,28 @@ def _convert_graph(
                     "causal slice reached deterministic "
                     f"candidate_evaluation_budget="
                     f"{stats.get('candidate_evaluation_budget')}"
+                ),
+            )
+        )
+    if stats.get("sva_exact_trigger_missing"):
+        diagnostics.append(
+            _diagnostic(
+                "sva_exact_trigger_missing",
+                (
+                    "SVA implication requires hash-bound exact trigger "
+                    "evidence; heuristic trigger search is diagnostic-only"
+                ),
+            )
+        )
+    if temporal_work_reached:
+        diagnostics.append(
+            _diagnostic(
+                "sva_temporal_work_reached",
+                (
+                    "SVA temporal analysis reached its deterministic "
+                    f"lookback/value budget "
+                    f"({stats.get('temporal_lookback_budget')}/"
+                    f"{stats.get('temporal_value_budget')})"
                 ),
             )
         )
@@ -327,40 +376,57 @@ def _convert_graph(
     }
 
 
-def _build_causal_graph_v2(
-    request: CausalAnalysisRequestV2 | Mapping[str, Any],
-    *,
-    production: bool,
-) -> Dict[str, Any]:
-    if not isinstance(request, CausalAnalysisRequestV2):
-        request = CausalAnalysisRequestV2.from_dict(request, production=production)
-    if production and not request.strict:
-        raise ValueError("production V2 API requires strict=true")
-    if not production and request.strict:
-        raise ValueError("diagnostic heuristic requests require strict=false")
+class CausalPreparationError(RuntimeError):
+    """Preparation failed before an authoritative graph could be built."""
 
+    def __init__(
+        self,
+        diagnostics: List[Dict[str, Any]],
+        *,
+        status: str = "incomplete",
+    ):
+        super().__init__(
+            diagnostics[0]["message"]
+            if diagnostics
+            else "causal analysis preparation failed"
+        )
+        self.diagnostics = diagnostics
+        self.status = status
+
+
+def _validate_file_identities(
+    request: CausalAnalysisRequestV2,
+) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+    """Revalidate every trust-boundary byte before consulting caches."""
     diagnostics: List[Dict[str, Any]] = []
     try:
         actual_hash, actual_bytes = sha256_file(request.trace.path)
-    except OSError as error:
-        diagnostics.append(
-            _diagnostic("waveform_hash_mismatch", "trace file is unavailable")
-        )
-        return _empty_graph(request, diagnostics)
-    if (actual_hash, actual_bytes) != (request.trace.sha256, request.trace.bytes):
+    except OSError:
         diagnostics.append(
             _diagnostic(
                 "waveform_hash_mismatch",
-                "trace bytes or SHA-256 differ from the request",
+                "trace file is unavailable",
             )
         )
+    else:
+        if (actual_hash, actual_bytes) != (
+            request.trace.sha256,
+            request.trace.bytes,
+        ):
+            diagnostics.append(
+                _diagnostic(
+                    "waveform_hash_mismatch",
+                    "trace bytes or SHA-256 differ from the request",
+                )
+            )
 
     artifact_by_path: Dict[str, str] = {}
     for artifact in request.rtl_files:
-        artifact_by_path[os.path.abspath(artifact.path)] = artifact.artifact_id
+        absolute_path = os.path.abspath(artifact.path)
+        artifact_by_path[absolute_path] = artifact.artifact_id
         try:
             actual_hash, actual_bytes = sha256_file(artifact.path)
-        except OSError as error:
+        except OSError:
             diagnostics.append(
                 _diagnostic(
                     "rtl_file_hash_mismatch",
@@ -369,7 +435,10 @@ def _build_causal_graph_v2(
                 )
             )
             continue
-        if (actual_hash, actual_bytes) != (artifact.sha256, artifact.bytes):
+        if (actual_hash, actual_bytes) != (
+            artifact.sha256,
+            artifact.bytes,
+        ):
             diagnostics.append(
                 _diagnostic(
                     "rtl_file_hash_mismatch",
@@ -377,71 +446,379 @@ def _build_causal_graph_v2(
                     artifact_id=artifact.artifact_id,
                 )
             )
-    if diagnostics:
-        return _empty_graph(request, diagnostics)
+    return diagnostics, artifact_by_path
+
+
+def _parsed_design_cache_key(
+    request: CausalAnalysisRequestV2,
+) -> str:
+    return canonical_sha256(
+        {
+            "schema_version": "parsed_design_cache_key.v1",
+            "rtl_files": sorted(
+                (
+                    {
+                        "artifact_id": artifact.artifact_id,
+                        "sha256": artifact.sha256,
+                        "bytes": artifact.bytes,
+                    }
+                    for artifact in request.rtl_files
+                ),
+                key=lambda row: row["artifact_id"],
+            ),
+            "analyzer_revision": ANALYZER_REVISION,
+            "hdlconvertor_revision": HDLCONVERTOR_REVISION,
+            "parser_language_policy": "closure-system-verilog-if-any-v1",
+            "include_policy": "required-artifact-directories-v1",
+            "strict": request.strict,
+        }
+    )
+
+
+def _persistent_cache_path(cache_key: str) -> Optional[Path]:
+    cache_root = os.environ.get("VCA_PARSED_DESIGN_CACHE_DIR")
+    if not cache_root:
+        return None
+    return Path(cache_root) / f"{cache_key}.json"
+
+
+def _valid_cache_entry(
+    entry: Any,
+    cache_key: str,
+) -> bool:
+    if not isinstance(entry, Mapping):
+        return False
+    payload = entry.get("payload")
+    return bool(
+        entry.get("schema_version")
+        == "parsed_design_cache_entry.v1"
+        and entry.get("cache_key") == cache_key
+        and isinstance(payload, Mapping)
+        and entry.get("payload_sha256") == canonical_sha256(payload)
+        and not contains_absolute_path(payload)
+        and not _contains_absolute_path_fragment(payload)
+    )
+
+
+def _load_persistent_cache(
+    cache_key: str,
+) -> Optional[Dict[str, Any]]:
+    cache_path = _persistent_cache_path(cache_key)
+    if cache_path is None:
+        return None
+    try:
+        entry = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return entry if _valid_cache_entry(entry, cache_key) else None
+
+
+def _write_persistent_cache(
+    cache_key: str,
+    payload: Mapping[str, Any],
+) -> None:
+    cache_path = _persistent_cache_path(cache_key)
+    if cache_path is None:
+        return
+    entry = {
+        "schema_version": "parsed_design_cache_entry.v1",
+        "cache_key": cache_key,
+        "payload_sha256": canonical_sha256(payload),
+        "payload": payload,
+    }
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=f".{cache_key}.",
+        suffix=".tmp",
+        dir=cache_path.parent,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(
+                entry,
+                handle,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, cache_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+
+
+def _prepare_parser(
+    request: CausalAnalysisRequestV2,
+    artifact_by_path: Mapping[str, str],
+) -> Tuple[VerilogParser, str]:
+    cache_key = _parsed_design_cache_key(request)
+    artifact_paths = {
+        artifact.artifact_id: artifact.path
+        for artifact in request.rtl_files
+    }
+    artifact_path_identity = tuple(sorted(artifact_paths.items()))
+    cached: Optional[Dict[str, Any]]
+    with _PARSED_DESIGN_CACHE_LOCK:
+        live_entry = _PARSED_DESIGN_CACHE.get(cache_key)
+        cached = None
+        if live_entry is not None:
+            cached = {
+                "cache_key": live_entry.get("cache_key"),
+                "payload_sha256": live_entry.get("payload_sha256"),
+                # Cache payloads are immutable after publication.
+                "payload": live_entry.get("payload"),
+                "prepared_parser": (
+                    live_entry.get("prepared_parser")
+                    if live_entry.get("artifact_path_identity")
+                    == artifact_path_identity
+                    else None
+                ),
+            }
+            _PARSED_DESIGN_CACHE.move_to_end(cache_key)
+    if cached is not None:
+        payload = cached.get("payload")
+        prepared_parser = cached.get("prepared_parser")
+        if (
+            cached.get("cache_key") == cache_key
+            and isinstance(prepared_parser, VerilogParser)
+        ):
+            # The same-process object was created only after byte/hash
+            # validation and is never mutated structurally after publication.
+            return prepared_parser, "hit"
+        if (
+            cached.get("cache_key") == cache_key
+            and isinstance(payload, Mapping)
+            and cached.get("payload_sha256")
+            == canonical_sha256(payload)
+            and not contains_absolute_path(payload)
+            and not _contains_absolute_path_fragment(payload)
+        ):
+            try:
+                return (
+                    VerilogParser.from_prepared_design(
+                        payload,
+                        artifact_paths,
+                        strict=True,
+                    ),
+                    "hit",
+                )
+            except (KeyError, TypeError, ValueError):
+                pass
+        with _PARSED_DESIGN_CACHE_LOCK:
+            _PARSED_DESIGN_CACHE.pop(cache_key, None)
+
+    persistent = _load_persistent_cache(cache_key)
+    if persistent is not None:
+        try:
+            parser = VerilogParser.from_prepared_design(
+                persistent["payload"],
+                artifact_paths,
+                strict=True,
+            )
+        except (KeyError, TypeError, ValueError):
+            pass
+        else:
+            with _PARSED_DESIGN_CACHE_LOCK:
+                _PARSED_DESIGN_CACHE[cache_key] = {
+                    **persistent,
+                    "artifact_path_identity": artifact_path_identity,
+                    "prepared_parser": parser,
+                }
+                _PARSED_DESIGN_CACHE.move_to_end(cache_key)
+                while (
+                    len(_PARSED_DESIGN_CACHE)
+                    > _PARSED_DESIGN_CACHE_MAX
+                ):
+                    _PARSED_DESIGN_CACHE.popitem(last=False)
+            return parser, "hit"
 
     parser = VerilogParser(strict=True)
-    try:
-        for artifact in sorted(request.rtl_files, key=lambda item: item.artifact_id):
-            parser.parse_file(artifact.path)
-    except Exception as error:
-        artifact_id = next(
+    parser.parse_files_strict(
+        artifact.path
+        for artifact in sorted(
+            request.rtl_files,
+            key=lambda item: item.artifact_id,
+        )
+    )
+    payload = parser.to_prepared_design(artifact_by_path)
+    if (
+        not contains_absolute_path(payload)
+        and not _contains_absolute_path_fragment(payload)
+    ):
+        entry = {
+            "schema_version": "parsed_design_cache_entry.v1",
+            "cache_key": cache_key,
+            "payload_sha256": canonical_sha256(payload),
+            "payload": payload,
+            "artifact_path_identity": artifact_path_identity,
+            "prepared_parser": parser,
+        }
+        with _PARSED_DESIGN_CACHE_LOCK:
+            _PARSED_DESIGN_CACHE[cache_key] = entry
+            _PARSED_DESIGN_CACHE.move_to_end(cache_key)
+            while len(_PARSED_DESIGN_CACHE) > _PARSED_DESIGN_CACHE_MAX:
+                _PARSED_DESIGN_CACHE.popitem(last=False)
+        try:
+            _write_persistent_cache(cache_key, payload)
+        except OSError:
+            # Cache availability is never part of semantic authority.
+            pass
+        cache_status = "miss"
+    else:
+        cache_status = "disabled"
+    return parser, cache_status
+
+
+def _session_identity(
+    request: CausalAnalysisRequestV2,
+) -> Tuple[Any, ...]:
+    return (
+        request.trace.path,
+        request.trace.sha256,
+        request.trace.bytes,
+        tuple(
             (
-                artifact.artifact_id
-                for artifact in request.rtl_files
-                if artifact.path in str(error)
-            ),
-            None,
-        )
-        diagnostics.append(
-            _diagnostic(
-                "rtl_parse_failed",
-                f"required RTL parse failed ({type(error).__name__})",
-                artifact_id=artifact_id,
+                artifact.artifact_id,
+                artifact.path,
+                artifact.sha256,
+                artifact.bytes,
             )
-        )
-        return _empty_graph(request, diagnostics)
+            for artifact in request.rtl_files
+        ),
+        request.clock_signal,
+        request.strict,
+    )
 
-    waveform: Optional[CycleAlignedWaveform] = None
-    try:
-        waveform = CycleAlignedWaveform(
-            request.trace.path, request.clock_signal, exact_clock=True
-        )
-    except ValueError as error:
-        diagnostics.append(_diagnostic("clock_not_exact", str(error)))
-        return _empty_graph(request, diagnostics)
-    except Exception as error:
-        diagnostics.append(
-            _diagnostic(
-                "rtl_construct_unsupported",
-                f"waveform open failed ({type(error).__name__})",
+
+class PreparedCausalAnalysis:
+    """Verified parser/waveform state reusable across typed endpoints."""
+
+    def __init__(
+        self,
+        request: CausalAnalysisRequestV2 | Mapping[str, Any],
+        *,
+        production: bool = True,
+    ):
+        if not isinstance(request, CausalAnalysisRequestV2):
+            request = CausalAnalysisRequestV2.from_dict(
+                request, production=production
             )
-        )
-        return _empty_graph(request, diagnostics, status="unsupported")
+        if production and not request.strict:
+            raise ValueError("production V2 API requires strict=true")
+        if not production and request.strict:
+            raise ValueError(
+                "diagnostic heuristic requests require strict=false"
+            )
 
-    try:
-        if not waveform.has_exact_signal(request.endpoint_signal):
+        diagnostics, artifact_by_path = _validate_file_identities(request)
+        if diagnostics:
+            raise CausalPreparationError(diagnostics)
+        try:
+            parser, cache_status = _prepare_parser(
+                request, artifact_by_path
+            )
+        except Exception as error:
+            artifact_id = next(
+                (
+                    artifact.artifact_id
+                    for artifact in request.rtl_files
+                    if artifact.path in str(error)
+                ),
+                None,
+            )
+            raise CausalPreparationError(
+                [
+                    _diagnostic(
+                        "rtl_parse_failed",
+                        (
+                            "required RTL parse failed "
+                            f"({type(error).__name__})"
+                        ),
+                        artifact_id=artifact_id,
+                    )
+                ]
+            ) from error
+
+        try:
+            waveform = CycleAlignedWaveform(
+                request.trace.path,
+                request.clock_signal,
+                exact_clock=True,
+            )
+        except ValueError as error:
+            raise CausalPreparationError(
+                [_diagnostic("clock_not_exact", str(error))]
+            ) from error
+        except Exception as error:
+            raise CausalPreparationError(
+                [
+                    _diagnostic(
+                        "rtl_construct_unsupported",
+                        (
+                            "waveform open failed "
+                            f"({type(error).__name__})"
+                        ),
+                    )
+                ],
+                status="unsupported",
+            ) from error
+
+        self.request = request
+        self.parser = parser
+        self.waveform = waveform
+        self.artifact_by_path = dict(artifact_by_path)
+        self.cache_status = cache_status
+        self._identity = _session_identity(request)
+        self._production = production
+        self._closed = False
+
+    def build(
+        self,
+        request: CausalAnalysisRequestV2 | Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Build one graph while reusing verified frontend state."""
+        if self._closed:
+            raise RuntimeError("prepared causal analysis is closed")
+        if not isinstance(request, CausalAnalysisRequestV2):
+            request = CausalAnalysisRequestV2.from_dict(
+                request, production=self._production
+            )
+        if _session_identity(request) != self._identity:
+            raise ValueError(
+                "request does not match prepared RTL/trace/clock identity"
+            )
+
+        diagnostics: List[Dict[str, Any]] = []
+        if not self.waveform.has_exact_signal(request.endpoint_signal):
             diagnostics.append(
                 _diagnostic(
                     "endpoint_not_exact",
-                    f"endpoint is not an exact waveform signal: {request.endpoint_signal}",
+                    (
+                        "endpoint is not an exact waveform signal: "
+                        f"{request.endpoint_signal}"
+                    ),
                 )
             )
             return _empty_graph(request, diagnostics)
-        if request.endpoint_cycle >= waveform.get_cycle_count():
+        if request.endpoint_cycle >= self.waveform.get_cycle_count():
             diagnostics.append(
                 _diagnostic(
                     "endpoint_not_exact",
-                    f"endpoint cycle {request.endpoint_cycle} is outside the waveform",
+                    (
+                        f"endpoint cycle {request.endpoint_cycle} "
+                        "is outside the waveform"
+                    ),
                 )
             )
             return _empty_graph(request, diagnostics)
-        if (
-            waveform.get_signal_value(
-                request.endpoint_signal, request.endpoint_cycle
-            )
-            is None
-        ):
+        if self.waveform.get_signal_value(
+            request.endpoint_signal,
+            request.endpoint_cycle,
+        ) is None:
             diagnostics.append(
                 _diagnostic(
                     "waveform_signal_missing",
@@ -451,13 +828,15 @@ def _build_causal_graph_v2(
             return _empty_graph(request, diagnostics)
 
         slicer = BackwardSlicer(
-            parser,
-            waveform,
+            self.parser,
+            self.waveform,
             max_depth=request.max_depth,
             max_nodes=request.max_nodes,
+            allow_heuristic_sva_trigger=not self._production,
         )
         nodes, edges = slicer.slice_from_endpoint(
-            request.endpoint_signal, request.endpoint_cycle
+            request.endpoint_signal,
+            request.endpoint_cycle,
         )
         if not nodes:
             diagnostics.append(
@@ -473,10 +852,49 @@ def _build_causal_graph_v2(
             (edge.to_dict() for edge in edges),
             slicer.get_statistics(),
             diagnostics,
-            artifact_by_path,
+            self.artifact_by_path,
         )
-    finally:
-        waveform.close()
+
+    def close(self) -> None:
+        if not self._closed:
+            self.waveform.close()
+            self._closed = True
+
+    def __enter__(self) -> "PreparedCausalAnalysis":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        self.close()
+        return False
+
+
+def prepare_causal_analysis(
+    request: CausalAnalysisRequestV2 | Mapping[str, Any],
+) -> PreparedCausalAnalysis:
+    """Prepare one verified production session for multiple endpoints."""
+    return PreparedCausalAnalysis(request, production=True)
+
+
+def _build_causal_graph_v2(
+    request: CausalAnalysisRequestV2 | Mapping[str, Any],
+    *,
+    production: bool,
+) -> Dict[str, Any]:
+    if not isinstance(request, CausalAnalysisRequestV2):
+        request = CausalAnalysisRequestV2.from_dict(
+            request, production=production
+        )
+    try:
+        with PreparedCausalAnalysis(
+            request, production=production
+        ) as prepared:
+            return prepared.build(request)
+    except CausalPreparationError as error:
+        return _empty_graph(
+            request,
+            error.diagnostics,
+            status=error.status,
+        )
 
 
 def build_causal_graph_v2(

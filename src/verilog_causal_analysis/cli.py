@@ -8,9 +8,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from .auto_detect import (
-    detect_assertion_trigger_cycle,
-    detect_clock_signal,
-    extract_assertion_from_filename,
+    resolve_diagnostic_inputs,
 )
 from .contracts import make_request_v2
 from .engine import _build_diagnostic_graph_v2, build_causal_graph_v2
@@ -30,6 +28,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-depth", "-d", type=int, default=12)
     parser.add_argument("--max-nodes", "-m", type=int, default=120)
     parser.add_argument("--random-seed", type=int, default=0)
+    parser.add_argument("--quiet", "-q", action="store_true")
     return parser
 
 
@@ -37,19 +36,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parser().parse_args(argv)
     trace_path = Path(args.fst).resolve()
     rtl_paths = [Path(path).resolve() for path in args.verilog]
-    heuristic_fields = []
-    clock = args.clock
-    if clock is None:
-        clock = detect_clock_signal(str(trace_path))
-        heuristic_fields.append("clock")
-    endpoint = args.endpoint
-    if endpoint is None:
-        endpoint = extract_assertion_from_filename(str(trace_path))
-        heuristic_fields.append("endpoint")
-    cycle = args.cycle
-    if cycle is None:
-        cycle = detect_assertion_trigger_cycle(str(trace_path), endpoint, clock)
-        heuristic_fields.append("cycle")
+    heuristic_fields = [
+        name
+        for name, value in (
+            ("clock", args.clock),
+            ("endpoint", args.endpoint),
+            ("cycle", args.cycle),
+        )
+        if value is None
+    ]
+    clock, endpoint, cycle = resolve_diagnostic_inputs(
+        str(trace_path),
+        clock_signal=args.clock,
+        endpoint_signal=args.endpoint,
+        endpoint_cycle=args.cycle,
+    )
 
     trace_hash, trace_bytes = sha256_file(trace_path)
     rtl_files = []
@@ -109,19 +110,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     (output_dir / "causal_graph.json").write_bytes(
         canonical_json_bytes(graph) + b"\n"
     )
-    print(
-        json.dumps(
-            {
-                "mode": (
-                    "diagnostic_heuristic" if heuristic_fields else "production_exact"
-                ),
-                "graph_id": graph["graph_id"],
-                "status": graph["status"],
-                "output": str(output_dir / "causal_graph.json"),
-            },
-            sort_keys=True,
+    if not args.quiet:
+        print(
+            json.dumps(
+                {
+                    "mode": (
+                        "diagnostic_heuristic"
+                        if heuristic_fields
+                        else "production_exact"
+                    ),
+                    "graph_id": graph["graph_id"],
+                    "status": graph["status"],
+                    "output": str(output_dir / "causal_graph.json"),
+                },
+                sort_keys=True,
+            )
         )
-    )
     return 0
 
 

@@ -10,8 +10,113 @@ Provides automatic detection of:
 
 import os
 import re
-from typing import List, Optional, Set
+from bisect import bisect_right
+from typing import List, Optional, Set, Tuple
 import pylibfst
+
+
+def _clock_from_signal_names(signal_names: List[str]) -> str:
+    candidates = []
+    for signal_name in signal_names:
+        parts = signal_name.split(".")
+        if len(parts) < 2:
+            continue
+        base = re.sub(r"\s*\[.*\]$", "", parts[-1].lower())
+        if base in {"clock", "clk"}:
+            candidates.append((len(parts), signal_name))
+    if not candidates:
+        raise RuntimeError(
+            "Could not find clock signal (clock/clk) in waveform hierarchy. "
+            "Please specify --clock manually."
+        )
+    return min(candidates)[1]
+
+
+def resolve_diagnostic_inputs(
+    fst_path: str,
+    *,
+    clock_signal: Optional[str],
+    endpoint_signal: Optional[str],
+    endpoint_cycle: Optional[int],
+) -> Tuple[str, str, int]:
+    """Resolve missing diagnostic fields with at most one FST open.
+
+    This helper remains diagnostic-only. Its inferred values do not gain V2
+    production identity authority.
+    """
+    endpoint = endpoint_signal or extract_assertion_from_filename(fst_path)
+    if clock_signal is not None and endpoint_cycle is not None:
+        return clock_signal, endpoint, endpoint_cycle
+
+    fst = pylibfst.lib.fstReaderOpen(fst_path.encode("UTF-8"))
+    if fst == pylibfst.ffi.NULL:
+        raise RuntimeError(f"Failed to open FST file: {fst_path}")
+    try:
+        _, signals = pylibfst.get_scopes_signals2(fst)
+        names = sorted(signals.by_name)
+        if not names:
+            raise RuntimeError("No signals found in waveform")
+        clock = clock_signal or _clock_from_signal_names(names)
+        clock_row = signals.by_name.get(clock)
+        if clock_row is None:
+            raise RuntimeError(f"Clock signal not found in waveform: {clock}")
+        endpoint_row = signals.by_name.get(endpoint)
+        if endpoint_cycle is None and endpoint_row is None:
+            raise RuntimeError(
+                f"Assertion signal not found in waveform: {endpoint}"
+            )
+
+        pylibfst.lib.fstReaderClrFacProcessMaskAll(fst)
+        pylibfst.lib.fstReaderSetFacProcessMask(fst, clock_row.handle)
+        if endpoint_cycle is None and endpoint_row is not None:
+            pylibfst.lib.fstReaderSetFacProcessMask(
+                fst, endpoint_row.handle
+            )
+        timestamps = pylibfst.lib.fstReaderGetTimestamps(fst)
+        if timestamps.nvals == 0:
+            pylibfst.lib.fstReaderFreeTimestamps(timestamps)
+            raise RuntimeError("No timestamps found in waveform")
+        buffer = pylibfst.ffi.new("char[256]")
+        clock_boundaries: List[int] = []
+        previous_clock = None
+        previous_endpoint = None
+        trigger_time = None
+        for index in range(timestamps.nvals):
+            time = int(timestamps.val[index])
+            clock_value = pylibfst.helpers.string(
+                pylibfst.lib.fstReaderGetValueFromHandleAtTime(
+                    fst, time, clock_row.handle, buffer
+                )
+            )
+            if (
+                clock_value == "1"
+                and previous_clock in ("0", "x", "X", None)
+            ):
+                clock_boundaries.append(time)
+            previous_clock = clock_value
+            if endpoint_cycle is None and endpoint_row is not None:
+                endpoint_value = pylibfst.helpers.string(
+                    pylibfst.lib.fstReaderGetValueFromHandleAtTime(
+                        fst, time, endpoint_row.handle, buffer
+                    )
+                )
+                if previous_endpoint == "1" and endpoint_value == "0":
+                    trigger_time = time
+                    break
+                previous_endpoint = endpoint_value
+        pylibfst.lib.fstReaderFreeTimestamps(timestamps)
+        if endpoint_cycle is None:
+            if trigger_time is None:
+                raise RuntimeError(
+                    f"Assertion signal '{endpoint}' did not transition "
+                    "from 1 to 0. Cannot detect trigger cycle."
+                )
+            endpoint_cycle = max(
+                0, bisect_right(clock_boundaries, trigger_time) - 1
+            )
+        return clock, endpoint, endpoint_cycle
+    finally:
+        pylibfst.lib.fstReaderClose(fst)
 
 
 def extract_assertion_from_filename(fst_path: str) -> str:
@@ -52,65 +157,12 @@ def detect_assertion_trigger_cycle(fst_path: str, assertion_signal: str, clock_s
     Raises:
         RuntimeError: If assertion signal not found or didn't trigger
     """
-    from .cycle_waveform import CycleAlignedWaveform
-    
-    waveform = CycleAlignedWaveform(fst_path, clock_signal)
-    try:
-        # Open FST to read signal directly
-        fst = pylibfst.lib.fstReaderOpen(fst_path.encode("UTF-8"))
-        if fst == pylibfst.ffi.NULL:
-            raise RuntimeError(f"Failed to open FST file: {fst_path}")
-        
-        try:
-            scopes, signals = pylibfst.get_scopes_signals2(fst)
-            
-            sig = signals.by_name.get(assertion_signal)
-            if not sig:
-                raise RuntimeError(f"Assertion signal not found in waveform: {assertion_signal}")
-            
-            # Set process mask for this signal
-            pylibfst.lib.fstReaderClrFacProcessMaskAll(fst)
-            pylibfst.lib.fstReaderSetFacProcessMask(fst, sig.handle)
-            
-            timestamps = pylibfst.lib.fstReaderGetTimestamps(fst)
-            if timestamps.nvals == 0:
-                raise RuntimeError("No timestamps found in waveform")
-            
-            buf = pylibfst.ffi.new("char[256]")
-            prev_value = None
-            trigger_time = None
-            
-            for ts in range(timestamps.nvals):
-                time = timestamps.val[ts]
-                value = pylibfst.helpers.string(
-                    pylibfst.lib.fstReaderGetValueFromHandleAtTime(
-                        fst, time, sig.handle, buf
-                    )
-                )
-                
-                # Detect falling edge (1 -> 0) which indicates assertion failure
-                if prev_value == '1' and value == '0':
-                    trigger_time = int(time)
-                    break
-                    
-                prev_value = value
-            
-            pylibfst.lib.fstReaderFreeTimestamps(timestamps)
-            
-            if trigger_time is None:
-                raise RuntimeError(
-                    f"Assertion signal '{assertion_signal}' did not transition from 1 to 0. "
-                    f"Cannot detect trigger cycle."
-                )
-            
-            # Convert time to cycle
-            trigger_cycle = waveform.time_to_cycle(trigger_time)
-            return trigger_cycle
-            
-        finally:
-            pylibfst.lib.fstReaderClose(fst)
-    finally:
-        waveform.close()
+    return resolve_diagnostic_inputs(
+        fst_path,
+        clock_signal=clock_signal,
+        endpoint_signal=assertion_signal,
+        endpoint_cycle=None,
+    )[2]
 
 
 def detect_clock_signal(fst_path: str) -> str:
@@ -134,44 +186,7 @@ def detect_clock_signal(fst_path: str) -> str:
     
     try:
         _, signals = pylibfst.get_scopes_signals2(fst)
-        all_sigs = list(signals.by_name.keys())
-        
-        if not all_sigs:
-            raise RuntimeError("No signals found in waveform")
-        
-        # Find the top-level module prefix (first component of hierarchy)
-        top_modules = set()
-        for sig in all_sigs:
-            parts = sig.split('.')
-            if len(parts) >= 1:
-                top_modules.add(parts[0])
-        
-        # Look for clock signal in top-level modules
-        clock_candidates = []
-        for sig in all_sigs:
-            # Check if it's a clock signal (ends with .clock or .clk)
-            parts = sig.split('.')
-            if len(parts) >= 2:
-                signal_name = parts[-1].lower()
-                # Remove bit width suffix like "[31:0]"
-                signal_name = re.sub(r'\s*\[.*\]$', '', signal_name)
-                
-                if signal_name in ('clock', 'clk'):
-                    # Prefer top-level clock (fewer hierarchy levels)
-                    depth = len(parts)
-                    clock_candidates.append((depth, sig))
-        
-        if not clock_candidates:
-            raise RuntimeError(
-                "Could not find clock signal (clock/clk) in waveform hierarchy. "
-                "Please specify --clock manually."
-            )
-        
-        # Sort by hierarchy depth (prefer shallower/top-level clocks)
-        clock_candidates.sort(key=lambda x: x[0])
-        
-        # Return the top-level clock (shallowest hierarchy)
-        return clock_candidates[0][1]
+        return _clock_from_signal_names(sorted(signals.by_name))
         
     finally:
         pylibfst.lib.fstReaderClose(fst)

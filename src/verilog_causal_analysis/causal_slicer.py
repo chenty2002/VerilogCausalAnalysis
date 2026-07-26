@@ -429,6 +429,200 @@ class ExpressionEvaluator:
         return None
 
 
+@dataclass(frozen=True)
+class CompiledExpression:
+    """Parsed expression tree reusable across counterfactual environments."""
+
+    expression: str
+    root: Any
+
+    @classmethod
+    def compile(cls, expression: str) -> "CompiledExpression":
+        parser = ExpressionEvaluator({})
+        text = expression.strip()
+        if not text:
+            return cls(expression=expression, root=("invalid",))
+        sva_match = parser.RE_SVA_IMPLICATION.match(text)
+        if sva_match:
+            root = (
+                "sva",
+                cls._compile_expr(parser, sva_match.group(1)),
+                cls._compile_expr(parser, sva_match.group(2)),
+            )
+        else:
+            root = cls._compile_expr(parser, text)
+        return cls(expression=expression, root=root)
+
+    @classmethod
+    def _compile_expr(
+        cls,
+        parser: ExpressionEvaluator,
+        expression: str,
+    ) -> Any:
+        expr = expression.strip()
+        if not expr:
+            return ("invalid",)
+
+        if expr.startswith("{") and expr.endswith("}"):
+            depth = 0
+            for index, char in enumerate(expr):
+                if char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                if depth == 0 and index < len(expr) - 1:
+                    break
+            else:
+                parts = parser._split_concat_parts(expr[1:-1])
+                if parts:
+                    return (
+                        "concat",
+                        tuple(cls._compile_expr(parser, part) for part in parts),
+                    )
+
+        if expr.startswith("(") and expr.endswith(")"):
+            depth = 0
+            for index, char in enumerate(expr):
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                if depth == 0 and index < len(expr) - 1:
+                    break
+            else:
+                return cls._compile_expr(parser, expr[1:-1])
+
+        ternary = parser._parse_ternary(expr)
+        if ternary:
+            condition, then_expr, else_expr = ternary
+            return (
+                "ternary",
+                cls._compile_expr(parser, condition),
+                cls._compile_expr(parser, then_expr),
+                cls._compile_expr(parser, else_expr),
+            )
+
+        op_pos, operator = parser._find_lowest_op(expr)
+        if operator is not None and op_pos > 0:
+            return (
+                "binary",
+                operator,
+                cls._compile_expr(parser, expr[:op_pos]),
+                cls._compile_expr(parser, expr[op_pos + len(operator):]),
+            )
+
+        if expr.startswith("!"):
+            return ("unary", "!", cls._compile_expr(parser, expr[1:]))
+        if expr.startswith("~"):
+            return ("unary", "~", cls._compile_expr(parser, expr[1:]))
+        if expr.startswith("-") and len(expr) > 1:
+            return ("unary", "-", cls._compile_expr(parser, expr[1:]))
+        if len(expr) > 1 and expr[0] in "&|^":
+            if expr[0] not in "&|" or expr[1] != expr[0]:
+                return (
+                    "reduction",
+                    expr[0],
+                    cls._compile_expr(parser, expr[1:]),
+                )
+
+        if parser.RE_NUMBER.match(expr) or expr.isdigit():
+            return ("literal", parser._eval_atom(expr))
+        return ("signal", expr)
+
+    def evaluate(self, signal_values: Dict[str, str]) -> Optional[str]:
+        evaluator = ExpressionEvaluator(signal_values)
+        try:
+            return self._evaluate_node(self.root, evaluator)
+        except Exception:
+            return None
+
+    @classmethod
+    def _evaluate_node(
+        cls,
+        node: Any,
+        evaluator: ExpressionEvaluator,
+    ) -> Optional[str]:
+        kind = node[0]
+        if kind == "invalid":
+            return None
+        if kind == "literal":
+            return node[1]
+        if kind == "signal":
+            return evaluator._eval_atom(node[1])
+        if kind == "concat":
+            values = [
+                cls._evaluate_node(child, evaluator)
+                for child in node[1]
+            ]
+            return None if any(value is None for value in values) else "".join(values)
+        if kind == "ternary":
+            condition = cls._evaluate_node(node[1], evaluator)
+            if condition is None:
+                return None
+            branch = node[2] if evaluator._is_true(condition) else node[3]
+            return cls._evaluate_node(branch, evaluator)
+        if kind == "binary":
+            left = cls._evaluate_node(node[2], evaluator)
+            right = cls._evaluate_node(node[3], evaluator)
+            if left is None or right is None:
+                return None
+            return evaluator._apply_binary_op(left, right, node[1])
+        if kind == "unary":
+            value = cls._evaluate_node(node[2], evaluator)
+            if value is None:
+                return None
+            if node[1] == "!":
+                return "1" if not evaluator._is_true(value) else "0"
+            if node[1] == "~":
+                return evaluator._bitwise_not(value)
+            int_value = parse_binary_value(value)
+            if int_value is None:
+                return None
+            negated = (-int_value) & ((1 << len(value)) - 1)
+            return bin(negated)[2:].zfill(len(value))
+        if kind == "reduction":
+            value = cls._evaluate_node(node[2], evaluator)
+            if value is None:
+                return None
+            if node[1] == "&":
+                return "1" if all(char == "1" for char in value) else "0"
+            if node[1] == "|":
+                return "1" if "1" in value else "0"
+            return "1" if value.count("1") % 2 else "0"
+        if kind == "sva":
+            antecedent = cls._evaluate_node(node[1], evaluator)
+            if antecedent is None:
+                return None
+            if not evaluator._is_true(antecedent):
+                return "1"
+            consequent = cls._evaluate_node(node[2], evaluator)
+            return consequent if consequent is not None else "0"
+        return None
+
+
+@dataclass(frozen=True)
+class StatementEvaluationKey:
+    """Identity of one target statement sampled at one target cycle."""
+
+    file_path: str
+    line_start: int
+    line_end: int
+    module_name: str
+    target: str
+    target_signal: str
+    target_cycle: int
+    expression: str
+    condition: str
+
+
+@dataclass(frozen=True)
+class _StatementEvaluationContext:
+    environment: Dict[str, str]
+    source_values: Dict[str, str]
+    compiled: CompiledExpression
+    original_result: Optional[str]
+
+
 class BackwardSlicer:
     """Backward slicing engine for building causal DAG.
     
@@ -440,20 +634,34 @@ class BackwardSlicer:
                  verilog_parser: VerilogParser, 
                  waveform: CycleAlignedWaveform,
                  max_depth: int = 20, 
-                 max_nodes: int = 200
+                 max_nodes: int = 200,
+                 *,
+                 exact_sva_trigger_cycle: Optional[int] = None,
+                 allow_heuristic_sva_trigger: bool = False,
                  ):
         """Initialize backward slicer with RTL parser and waveform data."""
         self.parser = verilog_parser
         self.waveform = waveform
         self.max_depth = max_depth
         self.max_nodes = max_nodes
-        # V2.1 derives deterministic work limits from max_nodes.  In
+        # V2.2 derives deterministic work limits from max_nodes.  In
         # particular, none of these limits expands when max_depth changes.
         self.weak_edge_budget = max(0, (max_nodes - 1) // 4)
         self.weak_beam_width = 2
         self.candidate_evaluation_budget = max_nodes * 8
+        self.temporal_lookback_budget = max(64, max_nodes * 8)
+        self.temporal_value_budget = max(256, max_nodes * 32)
+        self.exact_sva_trigger_cycle = exact_sva_trigger_cycle
+        self.allow_heuristic_sva_trigger = allow_heuristic_sva_trigger
         self.dep_graph = verilog_parser.build_dependency_graph()
         self._signal_sources_cache: Dict[str, List[str]] = {}
+        self._statement_evaluation_cache: Dict[
+            StatementEvaluationKey, _StatementEvaluationContext
+        ] = {}
+        self._compiled_expression_cache: Dict[str, CompiledExpression] = {}
+        self._equality_literal_cache: Dict[
+            Tuple[str, str, str], Optional[str]
+        ] = {}
         
         # DAG state
         self.nodes: Dict[str, CausalNode] = {}
@@ -477,11 +685,22 @@ class BackwardSlicer:
             "candidate_evaluations": 0,
             "candidate_evaluation_budget": self.candidate_evaluation_budget,
             "candidate_evaluation_budget_reached": False,
+            "statement_evaluations": 0,
+            "statement_environment_builds": 0,
+            "compiled_expression_hits": 0,
+            "compiled_expression_misses": 0,
             "rejected_candidates": 0,
             "weak_edges_admitted": 0,
             "weak_edge_budget": self.weak_edge_budget,
             "weak_beam_width": self.weak_beam_width,
             "undetermined_nodes": 0,
+            "temporal_lookback_budget": self.temporal_lookback_budget,
+            "temporal_value_budget": self.temporal_value_budget,
+            "temporal_cycles_evaluated": 0,
+            "temporal_values_loaded": 0,
+            "temporal_work_budget_reached": False,
+            "sva_trigger_evidence": "not_applicable",
+            "sva_exact_trigger_missing": False,
             "sva_trigger_cycle": None,
             "sva_time_window": None,  # (min_delay, max_delay) if SVA has time window
             "sva_window_end_cycle": None,  # The cycle when assertion failed (end of window)
@@ -554,6 +773,36 @@ class BackwardSlicer:
                               prefer_hierarchy: bool = True
                               ) -> Tuple[Optional[str], str]:
         """Resolve signal value with hierarchy and partial-match fallbacks."""
+        resolver = getattr(self.waveform, "resolve_signal", None)
+        if callable(resolver):
+            resolution = resolver(
+                signal,
+                hierarchy,
+                prefer_hierarchy=prefer_hierarchy,
+            )
+            if resolution.ambiguous and getattr(
+                self.waveform, "exact_clock", False
+            ):
+                ambiguity = {
+                    "signal": signal,
+                    "cycle": cycle,
+                    "candidate_count": len(resolution.candidates),
+                }
+                rows = self.stats.setdefault("identity_ambiguities", [])
+                if ambiguity not in rows:
+                    rows.append(ambiguity)
+                return None, signal
+            resolved_signal = resolution.resolved_signal
+            if resolved_signal is None and resolution.candidates:
+                resolved_signal = resolution.candidates[0]
+            if resolved_signal is not None:
+                value = self.waveform.get_signal_value(
+                    resolved_signal, cycle
+                )
+                if value is not None:
+                    return value, resolved_signal
+            return None, signal
+
         if prefer_hierarchy and hierarchy and not signal.startswith(hierarchy + '.'):
             full_signal = f"{hierarchy}.{signal}"
             value = self.waveform.get_signal_value(full_signal, cycle)
@@ -719,6 +968,21 @@ class BackwardSlicer:
             self.stats["sva_window_end_cycle"] = max_cycle
             # Pass dep sources to help extract consequent signals from truncated expressions
             self.stats["sva_consequent_signals"] = self._extract_consequent_signals(sva_expr, sources)
+
+        if self.exact_sva_trigger_cycle is not None:
+            if not 0 <= self.exact_sva_trigger_cycle <= max_cycle:
+                self.stats["temporal_work_budget_reached"] = True
+                self.stats["sva_trigger_evidence"] = "invalid_exact"
+                return None
+            self.stats["sva_trigger_evidence"] = "exact"
+            return self.exact_sva_trigger_cycle
+        if not self.allow_heuristic_sva_trigger:
+            # Production V2 has no hash-bound exact trigger field. Do not
+            # promote an RTL/FST heuristic to branch-observed authority.
+            self.stats["sva_trigger_evidence"] = "missing_exact"
+            self.stats["sva_exact_trigger_missing"] = True
+            return None
+        self.stats["sva_trigger_evidence"] = "diagnostic_heuristic"
         
         # Build a signal resolution cache for faster lookup
         signal_cache: Dict[str, str] = {}  # short_name -> resolved_full_name
@@ -748,11 +1012,21 @@ class BackwardSlicer:
         trigger_cycle = None
         last_true_cycle = None
         
-        for cycle in range(search_start, -1, -1):
+        search_floor = max(
+            0, search_start - self.temporal_lookback_budget + 1
+        )
+        for cycle in range(search_start, search_floor - 1, -1):
             env = {}
             for src in sorted(sources):
+                if (
+                    self.stats["temporal_values_loaded"]
+                    >= self.temporal_value_budget
+                ):
+                    self.stats["temporal_work_budget_reached"] = True
+                    return None
                 resolved_sig = signal_cache.get(src, src)
                 val = self.waveform.get_signal_value(resolved_sig, cycle)
+                self.stats["temporal_values_loaded"] += 1
                 if val:
                     # Add both short and full name to environment
                     env[src] = val
@@ -763,6 +1037,7 @@ class BackwardSlicer:
             # Evaluate antecedent
             evaluator = ExpressionEvaluator(env)
             result = evaluator.evaluate(antecedent)
+            self.stats["temporal_cycles_evaluated"] += 1
             
             if result and evaluator._is_true(result):
                 last_true_cycle = cycle
@@ -775,6 +1050,8 @@ class BackwardSlicer:
         # If we never found a false cycle, use the earliest true cycle
         if trigger_cycle is None and last_true_cycle is not None:
             trigger_cycle = last_true_cycle
+        if search_floor > 0 and trigger_cycle is None:
+            self.stats["temporal_work_budget_reached"] = True
         
         return trigger_cycle
     
@@ -782,9 +1059,8 @@ class BackwardSlicer:
                       parent_hierarchy: str = '') -> Tuple[CausalNode, bool]:
         """Resolve a candidate node without consuming graph node budget."""
         original_signal = signal
-        match_cache: Dict[str, List[str]] = {}
         value, resolved_signal = self._resolve_signal_value(
-            signal, cycle, parent_hierarchy, match_cache, prefer_hierarchy=False
+            signal, cycle, parent_hierarchy, prefer_hierarchy=False
         )
         signal = resolved_signal
         
@@ -892,13 +1168,98 @@ class BackwardSlicer:
             return max(0, target_cycle - 1)  # Previous cycle for sequential
         else:
             return max(0, target_cycle - 1)  # Default to previous
-    
+
+    @staticmethod
+    def _statement_key(
+        dep: Dependency,
+        target_signal: str,
+        target_cycle: int,
+    ) -> StatementEvaluationKey:
+        return StatementEvaluationKey(
+            file_path=dep.file_path,
+            line_start=dep.line_start,
+            line_end=dep.line_end,
+            module_name=dep.module_name,
+            target=dep.target_qualified or dep.target,
+            target_signal=target_signal,
+            target_cycle=target_cycle,
+            expression=dep.expression,
+            condition=dep.condition,
+        )
+
+    def _get_compiled_expression(
+        self,
+        expression: str,
+    ) -> CompiledExpression:
+        compiled = self._compiled_expression_cache.get(expression)
+        if compiled is not None:
+            self.stats["compiled_expression_hits"] += 1
+            return compiled
+        self.stats["compiled_expression_misses"] += 1
+        compiled = CompiledExpression.compile(expression)
+        self._compiled_expression_cache[expression] = compiled
+        return compiled
+
+    def _get_statement_evaluation(
+        self,
+        target_signal: str,
+        target_cycle: int,
+        dep: Dependency,
+        statement_dependencies: Tuple[Dependency, ...],
+    ) -> _StatementEvaluationContext:
+        """Build one base environment for every source of a statement."""
+        key = self._statement_key(dep, target_signal, target_cycle)
+        cached = self._statement_evaluation_cache.get(key)
+        if cached is not None:
+            return cached
+
+        target_hierarchy = self._extract_module_hierarchy(target_signal)
+        environment: Dict[str, str] = {}
+        source_values: Dict[str, str] = {}
+        for source_dep in sorted(
+            statement_dependencies,
+            key=lambda row: (
+                row.source,
+                row.dep_type.value,
+                row.source_qualified,
+            ),
+        ):
+            source_cycle = self._get_parent_cycle(source_dep, target_cycle)
+            value, _resolved = self._resolve_signal_value(
+                source_dep.source,
+                source_cycle,
+                target_hierarchy,
+                prefer_hierarchy=True,
+            )
+            if value is not None:
+                environment[source_dep.source] = value
+                source_values[source_dep.source] = value
+
+        compiled = self._get_compiled_expression(dep.expression)
+        original_result = (
+            compiled.evaluate(environment) if environment else None
+        )
+        context = _StatementEvaluationContext(
+            environment=environment,
+            source_values=source_values,
+            compiled=compiled,
+            original_result=original_result,
+        )
+        self._statement_evaluation_cache[key] = context
+        self.stats["statement_evaluations"] += 1
+        self.stats["statement_environment_builds"] += 1
+        return context
+
     def _evaluate_counterfactual(self,
                                   target_signal: str,
                                   target_cycle: int,
                                   source_signal: str,
                                   source_cycle: int,
-                                  dep: Dependency) -> Tuple[bool, float, List[Dict]]:
+                                  dep: Dependency,
+                                  statement_dependencies: Optional[
+                                      Tuple[Dependency, ...]
+                                  ] = None
+                                  ) -> Tuple[bool, float, List[Dict]]:
         """
         Evaluate if source causally affects target via counterfactual analysis.
         
@@ -913,32 +1274,32 @@ class BackwardSlicer:
             (is_causal, contribution_score, change_examples)
         """
         target_value = self.waveform.get_signal_value(target_signal, target_cycle)
-        source_value = self.waveform.get_signal_value(source_signal, source_cycle)
-        if target_value is None or source_value is None:
+        source_value = self.waveform.get_signal_value(
+            source_signal, source_cycle
+        )
+        if target_value is None:
             return False, 0.0, []
 
         if not dep.expression.strip():
             return self._simple_toggle_test(source_signal, source_cycle, target_signal, target_cycle)
 
-        target_base = self._extract_base_signal_name(target_signal)
-        target_hierarchy = self._extract_module_hierarchy(target_signal)
         source_base = self._extract_base_signal_name(source_signal)
-        module_hint = self._infer_module_name(target_signal, target_hierarchy)
-
-        env: Dict[str, str] = {}
-        match_cache: Dict[str, List[str]] = {}
-        for src in self._get_signal_sources_cached(target_base, module_hint):
-            val, _ = self._resolve_signal_value(
-                src, source_cycle, target_hierarchy, match_cache, prefer_hierarchy=True
-            )
-            if val is not None:
-                env[src] = val
+        context = self._get_statement_evaluation(
+            target_signal,
+            target_cycle,
+            dep,
+            statement_dependencies or (dep,),
+        )
+        env = context.environment
+        if source_value is None:
+            source_value = context.source_values.get(dep.source)
+        if source_value is None:
+            return False, 0.0, []
 
         if not env:
             return self._simple_toggle_test(source_signal, source_cycle, target_signal, target_cycle)
 
-        evaluator = ExpressionEvaluator(env)
-        orig_result = evaluator.evaluate(dep.expression)
+        orig_result = context.original_result
         if orig_result is None:
             return self._simple_toggle_test(source_signal, source_cycle, target_signal, target_cycle)
 
@@ -947,7 +1308,7 @@ class BackwardSlicer:
         perturb_value = invert_value(source_value)
         perturbed_env[perturb_key] = perturb_value
 
-        perturbed_result = ExpressionEvaluator(perturbed_env).evaluate(dep.expression)
+        perturbed_result = context.compiled.evaluate(perturbed_env)
         if perturbed_result is None:
             return False, 0.0, []
 
@@ -955,7 +1316,12 @@ class BackwardSlicer:
 
         if not is_causal and '==' in dep.expression:
             smart_result = self._try_smart_perturbation(
-                dep, env, source_value, source_base, orig_result
+                dep,
+                env,
+                source_value,
+                source_base,
+                orig_result,
+                context.compiled,
             )
             if smart_result is not None:
                 is_causal, perturbed_result, perturb_value = smart_result
@@ -989,7 +1355,9 @@ class BackwardSlicer:
                                  env: Dict[str, str],
                                  source_value: str,
                                  source_base: str,
-                                 orig_result: str) -> Optional[Tuple[bool, str, str]]:
+                                 orig_result: str,
+                                 compiled: Optional[CompiledExpression] = None
+                                 ) -> Optional[Tuple[bool, str, str]]:
         """
         Try smarter perturbation for equality comparisons.
         
@@ -1010,25 +1378,35 @@ class BackwardSlicer:
         
         # Pattern: source == literal
         # Try to extract the comparison value
-        patterns = [
-            # Match: signal == N'hX or signal == N'bX or signal == N'dX
-            re.compile(rf'\b{re.escape(source_base)}\s*==\s*(\d+\'[bhd][0-9a-fA-F_]+)'),
-            re.compile(rf'\b{re.escape(dep.source)}\s*==\s*(\d+\'[bhd][0-9a-fA-F_]+)'),
-            # Match: N'hX == signal (reversed order)
-            re.compile(rf'(\d+\'[bhd][0-9a-fA-F_]+)\s*==\s*{re.escape(source_base)}\b'),
-            re.compile(rf'(\d+\'[bhd][0-9a-fA-F_]+)\s*==\s*{re.escape(dep.source)}\b'),
-        ]
-        
-        target_value = None
-        for pattern in patterns:
-            match = pattern.search(expr)
-            if match:
-                # Parse the literal value
-                lit = match.group(1)
-                # Use ExpressionEvaluator to parse the literal
-                evaluator = ExpressionEvaluator({})
-                target_value = evaluator.evaluate(lit)
-                break
+        cache_key = (expr, dep.source, source_base)
+        if cache_key in self._equality_literal_cache:
+            target_value = self._equality_literal_cache[cache_key]
+        else:
+            signal_names = sorted(
+                {dep.source, source_base},
+                key=lambda name: (-len(name), name),
+            )
+            signal_pattern = "|".join(
+                re.escape(name) for name in signal_names
+            )
+            literal_pattern = r"(\d+'[bhd][0-9a-fA-F_]+)"
+            patterns = (
+                re.compile(
+                    rf"\b(?:{signal_pattern})\s*==\s*{literal_pattern}"
+                ),
+                re.compile(
+                    rf"{literal_pattern}\s*==\s*(?:{signal_pattern})\b"
+                ),
+            )
+            target_value = None
+            for pattern in patterns:
+                match = pattern.search(expr)
+                if match:
+                    target_value = ExpressionEvaluator({}).evaluate(
+                        match.group(1)
+                    )
+                    break
+            self._equality_literal_cache[cache_key] = target_value
         
         if target_value is None:
             return None
@@ -1050,8 +1428,8 @@ class BackwardSlicer:
         else:
             perturbed_env[dep.source] = perturb_val
         
-        perturbed_evaluator = ExpressionEvaluator(perturbed_env)
-        perturbed_result = perturbed_evaluator.evaluate(dep.expression)
+        expression = compiled or self._get_compiled_expression(dep.expression)
+        perturbed_result = expression.evaluate(perturbed_env)
         
         if perturbed_result is None:
             return None
@@ -1193,6 +1571,18 @@ class BackwardSlicer:
             self.stats["max_depth_reached"] = True
             return
 
+        statement_groups: Dict[
+            StatementEvaluationKey, Tuple[Dependency, ...]
+        ] = {}
+        grouped_rows: Dict[StatementEvaluationKey, List[Dependency]] = {}
+        for candidate_dep, _parent_cycle in candidates:
+            key = self._statement_key(
+                candidate_dep, node.signal, node.cycle
+            )
+            grouped_rows.setdefault(key, []).append(candidate_dep)
+        for key, rows in grouped_rows.items():
+            statement_groups[key] = tuple(rows)
+
         parents_to_recurse: List[Tuple[CausalNode, int]] = []
         weak_edges_for_target = 0
 
@@ -1224,7 +1614,10 @@ class BackwardSlicer:
             is_causal, score, examples = self._evaluate_counterfactual(
                 node.signal, node.cycle,
                 parent_node.signal, parent_cycle,
-                dep
+                dep,
+                statement_groups[
+                    self._statement_key(dep, node.signal, node.cycle)
+                ],
             )
             
             # For SVA assertions at trigger cycle, if antecedent is true,
@@ -1356,23 +1749,24 @@ class BackwardSlicer:
         
         # For each consequent signal, analyze at sample cycles
         for sig in sorted(consequent_signals):
-            full_sig = f"{hierarchy}.{sig}" if hierarchy else sig
-            
-            # Find if signal ever came close to being true (any 1 bit toggled)
-            last_value = None
-            interesting_cycles = []
-            
-            for cycle in range(window_start, window_end + 1):
-                val = self.waveform.get_signal_value(full_sig, cycle)
-                if val is None:
-                    # Try without hierarchy
-                    val = self.waveform.get_signal_value(sig, cycle)
-                
-                if val is not None:
-                    if last_value is not None and val != last_value:
-                        # Signal changed - this is interesting
-                        interesting_cycles.append(cycle)
-                    last_value = val
+            resolution = self.waveform.resolve_signal(
+                sig, hierarchy, prefer_hierarchy=True
+            )
+            resolved = resolution.resolved_signal
+            interesting_cycles: List[int] = []
+            if resolved is not None:
+                changes = self.waveform.get_value_changes_bounded(
+                    resolved,
+                    window_start,
+                    window_end,
+                    max_changes=5,
+                )
+                if changes is None:
+                    self.stats["temporal_work_budget_reached"] = True
+                else:
+                    interesting_cycles = [
+                        cycle for cycle, _old, _new in changes
+                    ]
             
             # Combine sample cycles with interesting cycles (limit to avoid explosion)
             cycles_to_analyze = list(set(sample_cycles + interesting_cycles[:5]))
@@ -1380,7 +1774,9 @@ class BackwardSlicer:
             
             for cycle in cycles_to_analyze:
                 # Create node for this signal at this cycle
-                node = self._get_or_create_node(sig, cycle, depth, hierarchy)
+                node = self._get_or_create_node(
+                    resolved or sig, cycle, depth, hierarchy
+                )
                 if node is not None:
                     # Mark as part of window analysis
                     if "window_analysis" not in [ref.get("type") for ref in node.rtl_refs]:
@@ -1418,6 +1814,7 @@ class BackwardSlicer:
         self.edges = []
         self.visited = set()
         self._edge_set = set()  # Track edges to prevent duplicates
+        self._statement_evaluation_cache = {}
         self.stats = self._new_stats()
         
         original_endpoint_cycle = endpoint_cycle  # This is the failure cycle
@@ -1542,4 +1939,8 @@ class BackwardSlicer:
     
     def get_statistics(self) -> Dict[str, Any]:
         """Get slicing statistics."""
-        return self.stats.copy()
+        result = self.stats.copy()
+        cache_stats = getattr(self.waveform, "get_cache_statistics", None)
+        if callable(cache_stats):
+            result.update(cache_stats())
+        return result
