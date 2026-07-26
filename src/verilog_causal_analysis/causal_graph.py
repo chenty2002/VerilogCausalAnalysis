@@ -34,7 +34,10 @@ from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Set, Tuple, Optional, Any
 
-import graphviz
+try:
+    import graphviz
+except ImportError:  # JSON analysis does not require visualization support.
+    graphviz = None
 
 from .verilog_parser import VerilogParser, DependencyType
 from .cycle_waveform import CycleAlignedWaveform
@@ -113,7 +116,7 @@ class CausalGraphBuilder:
         self.clock_signal = clock_signal
         self.max_depth = max_depth
         self.max_nodes = max_nodes
-        self.random_seed = random_seed if random_seed is not None else int(time.time())
+        self.random_seed = random_seed if random_seed is not None else 0
         random.seed(self.random_seed)
         
         self._verilog_parser = VerilogParser()
@@ -309,6 +312,10 @@ class CausalGraphBuilder:
     
     def export_graph(self, output_path: str, format: str = 'png', dpi: int = 300) -> str:
         """Export causal graph to image (PNG, PDF, SVG, etc.) using Graphviz."""
+        if graphviz is None:
+            raise RuntimeError(
+                "GraphViz export requires the optional 'visualization' dependency"
+            )
         result = self._require_result()
         base_path = os.path.splitext(self._ensure_dir(output_path))[0]
         

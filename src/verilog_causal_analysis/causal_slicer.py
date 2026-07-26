@@ -38,6 +38,7 @@ class CausalNode:
     is_root: bool = False
     is_endpoint: bool = False
     depth: int = 0
+    identity_strength: str = "unresolved"
 
     def __hash__(self): return hash(self.id)
     def __eq__(self, other): return isinstance(other, CausalNode) and self.id == other.id
@@ -53,7 +54,8 @@ class CausalNode:
             "rtl_context_missing": self.rtl_context_missing,
             "is_root": self.is_root,
             "is_endpoint": self.is_endpoint,
-            "depth": self.depth
+            "depth": self.depth,
+            "identity_strength": self.identity_strength,
         }
 
 
@@ -560,12 +562,25 @@ class BackwardSlicer:
             if match_cache is not None:
                 match_cache[signal] = matches
 
+        usable_matches = []
         for match in matches:
             match_base = re.sub(r'\s*\[\d+:\d+\]$', '', match)
             if match_base.endswith('.' + signal) or match_base.endswith(signal):
                 value = self.waveform.get_signal_value(match, cycle)
                 if value is not None:
-                    return value, match
+                    usable_matches.append((value, match))
+
+        if len(usable_matches) > 1 and getattr(self.waveform, "exact_clock", False):
+            self.stats.setdefault("identity_ambiguities", []).append(
+                {
+                    "signal": signal,
+                    "cycle": cycle,
+                    "candidate_count": len(usable_matches),
+                }
+            )
+            return None, signal
+        if usable_matches:
+            return usable_matches[0]
 
         return None, signal
     
@@ -692,7 +707,7 @@ class BackwardSlicer:
         
         # Build a signal resolution cache for faster lookup
         signal_cache: Dict[str, str] = {}  # short_name -> resolved_full_name
-        for src in sources:
+        for src in sorted(sources):
             full_src = f"{hierarchy}.{src}" if hierarchy else src
             # Try to find the actual signal in waveform (may have width suffix)
             matches = self.waveform.find_signal(src, max_results=5)
@@ -720,7 +735,7 @@ class BackwardSlicer:
         
         for cycle in range(search_start, -1, -1):
             env = {}
-            for src in sources:
+            for src in sorted(sources):
                 resolved_sig = signal_cache.get(src, src)
                 val = self.waveform.get_signal_value(resolved_sig, cycle)
                 if val:
@@ -758,6 +773,7 @@ class BackwardSlicer:
         )
         signal = resolved_signal
         
+        value_missing = value is None
         if value is None:
             value = 'x'  # Unknown value
         
@@ -787,7 +803,17 @@ class BackwardSlicer:
             value=value,
             rtl_refs=rtl_context.get("rtl_refs", []),
             rtl_context_missing=not rtl_context.get("found", False),
-            depth=depth
+            depth=depth,
+            identity_strength=(
+                "unresolved"
+                if value_missing
+                else "exact"
+                if original_signal == resolved_signal
+                else "hierarchy_inferred"
+                if parent_hierarchy
+                and resolved_signal == f"{parent_hierarchy}.{original_signal}"
+                else "basename_fallback"
+            ),
         )
         
         self.nodes[node_id] = node
@@ -1258,7 +1284,7 @@ class BackwardSlicer:
         sample_cycles = sorted(set(sample_cycles))
         
         # For each consequent signal, analyze at sample cycles
-        for sig in consequent_signals:
+        for sig in sorted(consequent_signals):
             full_sig = f"{hierarchy}.{sig}" if hierarchy else sig
             
             # Find if signal ever came close to being true (any 1 bit toggled)

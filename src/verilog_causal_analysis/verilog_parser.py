@@ -140,8 +140,10 @@ class VerilogParser:
     and module instantiations for causal graph construction.
     """
 
-    def __init__(self):
+    def __init__(self, *, strict: bool = False):
         self.converter = HdlConvertor()
+        self.strict = strict
+        self.diagnostics: List[Dict[str, Any]] = []
         self.modules: Dict[str, ModuleInfo] = {}
         self.all_signals: Dict[str, SignalInfo] = {}
         self.all_dependencies: List[Dependency] = []
@@ -473,7 +475,7 @@ class VerilogParser:
             
             dep_type = DependencyType.SEQUENTIAL if is_sequential else DependencyType.COMBINATIONAL
             
-            for source in sources:
+            for source in sorted(sources):
                 if source != target:  # Avoid self-loops
                     dep = self._make_dependency(
                         module=module,
@@ -489,7 +491,7 @@ class VerilogParser:
                     )
                     self._add_dependency(module, dep)
 
-            for source in condition_sources - sources:
+            for source in sorted(condition_sources - sources):
                 if source != target:
                     dep = self._make_dependency(
                         module=module,
@@ -517,7 +519,7 @@ class VerilogParser:
                 
                 dep_type = DependencyType.SEQUENTIAL if is_sequential else DependencyType.COMBINATIONAL
                 
-                for source in sources:
+                for source in sorted(sources):
                     if source != target:
                         dep = self._make_dependency(
                             module=module,
@@ -532,7 +534,7 @@ class VerilogParser:
                         )
                         self._add_dependency(module, dep)
 
-                for source in condition_sources - sources:
+                for source in sorted(condition_sources - sources):
                     if source != target:
                         dep = self._make_dependency(
                             module=module,
@@ -671,6 +673,16 @@ class VerilogParser:
         try:
             context = self.converter.parse([parse_path], lang, [os.path.dirname(file_path)], debug=False)
         except Exception as e:
+            diagnostic = {
+                "code": "rtl_parse_failed",
+                "severity": "error",
+                "breaks_complete": True,
+                "file_path": file_path,
+                "message": str(e),
+            }
+            self.diagnostics.append(diagnostic)
+            if self.strict:
+                raise RuntimeError(f"Failed to parse {file_path}: {e}") from e
             print(f"Warning: Failed to parse {file_path}: {e}")
             return []
         finally:
@@ -742,7 +754,7 @@ class VerilogParser:
                             sources = self._extract_signals_from_expr(body_obj.value)
                             expr_str = self._expr_to_string(body_obj.value)
                             
-                            for source in sources:
+                            for source in sorted(sources):
                                 if source != sig_name:
                                     dep = self._make_dependency(
                                         module=module,
@@ -828,6 +840,19 @@ class VerilogParser:
         
         # Parse SVA assertions (hdlConvertor may skip these)
         self._parse_sva_assertions(file_path, modules)
+
+        if self.strict and not modules:
+            diagnostic = {
+                "code": "rtl_parse_failed",
+                "severity": "error",
+                "breaks_complete": True,
+                "file_path": file_path,
+                "message": "required RTL file produced no module definitions",
+            }
+            self.diagnostics.append(diagnostic)
+            raise RuntimeError(
+                f"Required RTL file produced no module definitions: {file_path}"
+            )
         
         return modules
     

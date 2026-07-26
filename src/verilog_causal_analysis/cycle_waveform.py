@@ -44,7 +44,13 @@ class CycleAlignedWaveform:
     Provides discrete value(signal, cycle) lookups for causal analysis.
     """
     
-    def __init__(self, fst_path: str, clock_signal: str = "clock"):
+    def __init__(
+        self,
+        fst_path: str,
+        clock_signal: str = "clock",
+        *,
+        exact_clock: bool = False,
+    ):
         """
         Initialize cycle-aligned waveform parser.
         
@@ -57,6 +63,7 @@ class CycleAlignedWaveform:
         
         self.fst_path = fst_path
         self.clock_signal = clock_signal
+        self.exact_clock = exact_clock
         
         # Open FST file
         self.fst = pylibfst.lib.fstReaderOpen(fst_path.encode("UTF-8"))
@@ -84,7 +91,7 @@ class CycleAlignedWaveform:
     def _build_cycle_boundaries(self):
         """Build cycle boundaries from clock rising edges."""
         clock = self.signals.by_name.get(self.clock_signal)
-        if not clock:
+        if not clock and not self.exact_clock:
             # Try to find clock with partial match
             for sig_name in self.signals.by_name.keys():
                 if 'clock' in sig_name.lower() or 'clk' in sig_name.lower():
@@ -124,6 +131,9 @@ class CycleAlignedWaveform:
         
         pylibfst.lib.fstReaderFreeTimestamps(timestamps)
         self._cycle_count = len(self._cycle_boundaries)
+
+    def has_exact_signal(self, signal_name: str) -> bool:
+        return signal_name in self.signals.by_name
     
     def get_cycle_count(self) -> int:
         """Get total number of clock cycles."""

@@ -298,7 +298,7 @@ def build(fst_path: str,
         endpoint_cycle: Endpoint cycle number (auto-detect from assertion trigger if None)
         max_depth: Maximum traversal depth (default: 20)
         max_nodes: Maximum nodes in DAG (default: 200)
-        random_seed: Random seed for reproducibility (default: current time)
+        random_seed: Random seed for reproducibility (default: deterministic zero)
         quiet: If True, suppress auto-detection messages
         
     Returns:
