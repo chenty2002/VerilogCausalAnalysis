@@ -63,6 +63,14 @@ from .temporal_semantics import (
     build_transition_intervals,
     get_semantic_paths,
 )
+from .waitfor_graph import (
+    PROTOCOL_ADAPTER_SCHEMA,
+    WAITFOR_FEATURE,
+    WaitForError,
+    get_waitfor_component,
+    make_protocol_adapter,
+    validate_protocol_adapter,
+)
 
 __version__ = "2.3.0"
 
@@ -82,14 +90,14 @@ def prepare_causal_analysis(request):
 
 
 def build_causal_graph_v3(request, *, top_module=None):
-    """Build one opt-in C0-C4 Chisel semantic graph."""
+    """Build one opt-in C0-C5 Chisel semantic graph."""
     from .engine_v3 import build_causal_graph_v3 as _build
 
     return _build(request, top_module=top_module)
 
 
 def prepare_causal_session_v3(request, *, top_module=None):
-    """Prepare a reusable C0-C4 Chisel semantic session."""
+    """Prepare a reusable C0-C5 Chisel semantic session."""
     from .engine_v3 import prepare_causal_session_v3 as _prepare
 
     return _prepare(request, top_module=top_module)
@@ -117,11 +125,14 @@ __all__ = [
     "InstanceNode",
     "EndpointProjectionError",
     "PortBinding",
+    "PROTOCOL_ADAPTER_SCHEMA",
     "QueryError",
     "REQUEST_SCHEMA",
     "REQUEST_SCHEMA_V3",
     "SEMANTIC_GRAPH_SCHEMA",
     "TEMPORAL_FEATURE",
+    "WAITFOR_FEATURE",
+    "WaitForError",
     "SemanticQueryError",
     "build_causal_graph_v2",
     "build_causal_graph_v3",
@@ -133,15 +144,18 @@ __all__ = [
     "get_query_cache_statistics",
     "get_ranked_paths",
     "get_semantic_paths",
+    "get_waitfor_component",
     "get_raw_members",
     "get_register_transition",
     "make_request_v2",
     "make_request_v3",
+    "make_protocol_adapter",
     "prepare_causal_analysis",
     "prepare_causal_session_v3",
     "prepare_query_view",
     "build_transition_intervals",
     "sha256_file",
     "validate_graph_v2",
+    "validate_protocol_adapter",
     "__version__",
 ]

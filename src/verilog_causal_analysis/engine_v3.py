@@ -1,4 +1,4 @@
-"""C0-C4 execution for the explicit V3 Chisel profile."""
+"""C0-C5 execution for the explicit V3 Chisel profile."""
 
 from __future__ import annotations
 
@@ -31,6 +31,12 @@ from .engine import PreparedCausalAnalysis, _convert_graph, _diagnostic
 from .identity import ANALYZER_REVISION, stable_id, stable_set_sha256
 from .instance_graph import InstanceGraph, InstanceGraphError
 from .temporal_semantics import build_c4_temporal_layer, c4_enabled
+from .waitfor_graph import (
+    WaitForError,
+    build_c5_waitfor_layer,
+    c5_enabled,
+    load_protocol_adapter,
+)
 
 
 class _SemanticBoundaryProvider:
@@ -92,15 +98,19 @@ def _identity(request: CausalAnalysisRequestV3) -> Dict[str, Any]:
         ),
         "trace_sha256": request.trace.sha256,
         "analyzer_revision": (
-            f"{ANALYZER_REVISION}+c4"
-            if c4_enabled(request.semantic_profile.features)
+            f"{ANALYZER_REVISION}+c5"
+            if c5_enabled(request.semantic_profile.features)
             else (
-                f"{ANALYZER_REVISION}+c3"
-                if c3_enabled(request.semantic_profile.features)
+                f"{ANALYZER_REVISION}+c4"
+                if c4_enabled(request.semantic_profile.features)
                 else (
-                    f"{ANALYZER_REVISION}+c2"
-                    if c2_enabled(request.semantic_profile.features)
-                    else f"{ANALYZER_REVISION}+c1"
+                    f"{ANALYZER_REVISION}+c3"
+                    if c3_enabled(request.semantic_profile.features)
+                    else (
+                        f"{ANALYZER_REVISION}+c2"
+                        if c2_enabled(request.semantic_profile.features)
+                        else f"{ANALYZER_REVISION}+c1"
+                    )
                 )
             )
         ),
@@ -912,11 +922,67 @@ class PreparedCausalSessionV3:
             )
             temporal_work["raw_seed_count"] = len(raw_seed_signals)
             temporal_work["raw_seed_signals"] = raw_seed_signals
+        waitfor_diagnostics: list[Dict[str, Any]] = []
+        waitfor_work: Dict[str, Any] = {}
+        if c5_enabled(request.semantic_profile.features):
+            protocol_adapter = None
+            adapter_artifacts = [
+                item
+                for item in request.semantic_inputs
+                if item.kind == "reviewed_protocol_adapter"
+            ]
+            if adapter_artifacts:
+                adapter_artifact = adapter_artifacts[0]
+                try:
+                    protocol_adapter = load_protocol_adapter(
+                        adapter_artifact.path,
+                        sha256=adapter_artifact.sha256,
+                        bytes=adapter_artifact.bytes,
+                        rtl_set_sha256=_identity(request)["rtl_set_sha256"],
+                        known_semantic_ids={
+                            str(row["semantic_id"])
+                            for row in semantic_nodes
+                        },
+                    )
+                except WaitForError as error:
+                    waitfor_diagnostics.append(
+                        {
+                            "code": "protocol_adapter_invalid",
+                            "message": str(error),
+                            "breaks_complete": True,
+                        }
+                    )
+            if not waitfor_diagnostics:
+                (
+                    semantic_nodes,
+                    graph_edges,
+                    root_candidates,
+                    waitfor_diagnostics,
+                    waitfor_work,
+                ) = build_c5_waitfor_layer(
+                    semantic_nodes=semantic_nodes,
+                    edges=graph_edges,
+                    root_candidates=root_candidates,
+                    endpoint_cycle=request.endpoint.cycle,
+                    max_waitfor_nodes=request.bounds[
+                        "max_waitfor_nodes"
+                    ],
+                    max_waitfor_edges=request.bounds[
+                        "max_waitfor_edges"
+                    ],
+                    max_scc_candidates=request.bounds[
+                        "max_scc_candidates"
+                    ],
+                    protocol_adapter=protocol_adapter,
+                    rtl_set_sha256=_identity(request)["rtl_set_sha256"],
+                    max_total_edges=request.bounds["max_edges"],
+                )
         semantic_nodes.sort(key=lambda row: row["semantic_id"])
         all_diagnostics = raw["diagnostics"]
         all_diagnostics.extend(interval_diagnostics)
         all_diagnostics.extend(c3_diagnostics)
         all_diagnostics.extend(temporal_diagnostics)
+        all_diagnostics.extend(waitfor_diagnostics)
         max_semantic_nodes_reached = (
             len(semantic_nodes) > request.bounds["max_semantic_nodes"]
         )
@@ -933,6 +999,11 @@ class PreparedCausalSessionV3:
                 "missing_expected_completion",
                 "last_progress_event",
                 "stall_interval",
+                "unknown_external_completion",
+                "protocol_transaction",
+                "resource_wait",
+                "waitfor_component",
+                "waitfor_scc",
             }
             semantic_nodes = sorted(
                 semantic_nodes,
@@ -988,6 +1059,15 @@ class PreparedCausalSessionV3:
                     "semantic graph reached max_edges",
                 )
             )
+        result_bounds = {
+            **dict(request.bounds),
+            "signal_nodes_reached": raw["bounds"]["max_nodes_reached"],
+            "semantic_nodes_reached": max_semantic_nodes_reached,
+            "edges_reached": max_edges_reached,
+            "temporal_work": temporal_work,
+        }
+        if c5_enabled(request.semantic_profile.features):
+            result_bounds["waitfor_work"] = waitfor_work
         result = {
             "schema_version": SEMANTIC_GRAPH_SCHEMA,
             "graph_id": stable_id("vcsg_", identity),
@@ -1006,13 +1086,7 @@ class PreparedCausalSessionV3:
             "semantic_nodes": semantic_nodes,
             "edges": graph_edges,
             "root_candidates": root_candidates,
-            "bounds": {
-                **dict(request.bounds),
-                "signal_nodes_reached": raw["bounds"]["max_nodes_reached"],
-                "semantic_nodes_reached": max_semantic_nodes_reached,
-                "edges_reached": max_edges_reached,
-                "temporal_work": temporal_work,
-            },
+            "bounds": result_bounds,
             "diagnostics": sorted(
                 all_diagnostics,
                 key=lambda row: (row["code"], row.get("message", "")),

@@ -1,4 +1,4 @@
-"""Typed opt-in request contract for the C0-C4 Chisel semantic profile."""
+"""Typed opt-in request contract for the C0-C5 Chisel semantic profile."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ REQUEST_SCHEMA_V3 = "verilog_causal_request.v3"
 SEMANTIC_GRAPH_SCHEMA = "verilog_causal_semantic_graph.v1"
 CHISEL_PROFILE_VERSION = "chisel-semantic-profile.v1"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_C4_FEATURES = frozenset(
+_C5_FEATURES = frozenset(
     {
         "instance_graph",
         "endpoint_projection",
@@ -24,6 +24,7 @@ _C4_FEATURES = frozenset(
         "handshake",
         "pipeline",
         "temporal_interval",
+        "waitfor",
     }
 )
 
@@ -73,12 +74,15 @@ class FileArtifactV3:
             raise ContractV3Error(f"{where}.path must be absolute")
         if isinstance(size, bool) or not isinstance(size, int) or size < 0:
             raise ContractV3Error(f"{where}.bytes must be non-negative")
+        semantic_kinds = {
+            "assertion_endpoint_projection",
+            "reviewed_protocol_adapter",
+        }
         if semantic and (
-            not isinstance(kind, str)
-            or kind != "assertion_endpoint_projection"
+            not isinstance(kind, str) or kind not in semantic_kinds
         ):
             raise ContractV3Error(
-                f"{where}.kind must be assertion_endpoint_projection"
+                f"{where}.kind must be one of {sorted(semantic_kinds)}"
             )
         return cls(
             artifact_id,
@@ -180,11 +184,11 @@ class CausalAnalysisRequestV3:
             or profile_row["version"] != CHISEL_PROFILE_VERSION
             or not isinstance(features, list)
             or not features
-            or any(item not in _C4_FEATURES for item in features)
+            or any(item not in _C5_FEATURES for item in features)
         ):
             raise ContractV3Error(
-                "C0-C4 support only the explicit chisel profile features "
-                f"{sorted(_C4_FEATURES)}"
+                "C0-C5 support only the explicit chisel profile features "
+                f"{sorted(_C5_FEATURES)}"
             )
         canonical_features = tuple(sorted(set(features)))
         if "instance_graph" not in canonical_features:
@@ -207,6 +211,17 @@ class CausalAnalysisRequestV3:
         ):
             raise ContractV3Error(
                 "temporal_interval requires register_transition"
+            )
+        if "waitfor" in canonical_features and not {
+            "aggregate",
+            "handshake",
+            "pipeline",
+            "register_transition",
+            "temporal_interval",
+        } <= set(canonical_features):
+            raise ContractV3Error(
+                "waitfor requires aggregate, handshake, pipeline, "
+                "register_transition, and temporal_interval"
             )
         profile = SemanticProfileV3(
             "chisel", CHISEL_PROFILE_VERSION, canonical_features
@@ -271,13 +286,39 @@ class CausalAnalysisRequestV3:
         semantic_by_id = {item.artifact_id: item for item in semantic_inputs}
         if len(semantic_by_id) != len(semantic_inputs):
             raise ContractV3Error("semantic input IDs must be unique")
-        if evidence_ref is not None and evidence_ref not in semantic_by_id:
+        projection_inputs = [
+            item
+            for item in semantic_inputs
+            if item.kind == "assertion_endpoint_projection"
+        ]
+        adapter_inputs = [
+            item
+            for item in semantic_inputs
+            if item.kind == "reviewed_protocol_adapter"
+        ]
+        if len(projection_inputs) > 1 or len(adapter_inputs) > 1:
+            raise ContractV3Error(
+                "at most one endpoint projection and one protocol adapter "
+                "are allowed"
+            )
+        if (
+            evidence_ref is not None
+            and (
+                evidence_ref not in semantic_by_id
+                or semantic_by_id[evidence_ref].kind
+                != "assertion_endpoint_projection"
+            )
+        ):
             raise ContractV3Error(
                 "endpoint projection references an undeclared semantic input"
             )
-        if evidence_ref is None and semantic_inputs:
+        if evidence_ref is None and projection_inputs:
             raise ContractV3Error(
-                "unreferenced semantic inputs are not allowed"
+                "unreferenced assertion endpoint projection is not allowed"
+            )
+        if adapter_inputs and "waitfor" not in canonical_features:
+            raise ContractV3Error(
+                "reviewed protocol adapter requires feature waitfor"
             )
 
         required_bounds = {
