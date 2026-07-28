@@ -29,6 +29,7 @@ from .contracts_v3 import (
     REQUEST_SCHEMA_V3,
     SEMANTIC_GRAPH_SCHEMA,
     make_request_v3,
+    validate_semantic_graph_v3,
 )
 from .endpoint_projection import (
     ASSERTION_PROJECTION_SCHEMA,
@@ -71,6 +72,18 @@ from .waitfor_graph import (
     make_protocol_adapter,
     validate_protocol_adapter,
 )
+from .provenance import (
+    SOURCE_ANNOTATION_SCHEMA,
+    SOURCE_PROVENANCE_FEATURE,
+    ProvenanceError,
+)
+from .semantic_query import (
+    SemanticGraphQueryError,
+    get_handshake_timeline,
+    get_interval_evidence,
+    get_pipeline_occupancy,
+    get_semantic_overview,
+)
 
 __version__ = "2.3.0"
 
@@ -90,14 +103,14 @@ def prepare_causal_analysis(request):
 
 
 def build_causal_graph_v3(request, *, top_module=None):
-    """Build one opt-in C0-C5 Chisel semantic graph."""
+    """Build one opt-in C0-C6 Chisel semantic graph."""
     from .engine_v3 import build_causal_graph_v3 as _build
 
     return _build(request, top_module=top_module)
 
 
 def prepare_causal_session_v3(request, *, top_module=None):
-    """Prepare a reusable C0-C5 Chisel semantic session."""
+    """Prepare a reusable C0-C6 Chisel semantic session."""
     from .engine_v3 import prepare_causal_session_v3 as _prepare
 
     return _prepare(request, top_module=top_module)
@@ -134,6 +147,10 @@ __all__ = [
     "WAITFOR_FEATURE",
     "WaitForError",
     "SemanticQueryError",
+    "SemanticGraphQueryError",
+    "SOURCE_ANNOTATION_SCHEMA",
+    "SOURCE_PROVENANCE_FEATURE",
+    "ProvenanceError",
     "build_causal_graph_v2",
     "build_causal_graph_v3",
     "canonical_json_bytes",
@@ -144,6 +161,10 @@ __all__ = [
     "get_query_cache_statistics",
     "get_ranked_paths",
     "get_semantic_paths",
+    "get_semantic_overview",
+    "get_interval_evidence",
+    "get_handshake_timeline",
+    "get_pipeline_occupancy",
     "get_waitfor_component",
     "get_raw_members",
     "get_register_transition",
@@ -156,6 +177,7 @@ __all__ = [
     "build_transition_intervals",
     "sha256_file",
     "validate_graph_v2",
+    "validate_semantic_graph_v3",
     "validate_protocol_adapter",
     "__version__",
 ]

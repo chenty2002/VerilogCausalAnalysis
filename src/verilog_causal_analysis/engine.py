@@ -292,6 +292,17 @@ def _convert_graph(
                 ),
             )
         )
+    for miss in stats.get("exact_instance_waveform_misses") or []:
+        diagnostics.append(
+            _diagnostic(
+                "waveform_exact_instance_missing",
+                (
+                    f"signal {miss['signal']} has no exact waveform identity; "
+                    f"{miss['candidate_count']} cross-instance basename "
+                    "candidates were rejected"
+                ),
+            )
+        )
     if max_depth_reached:
         diagnostics.append(
             _diagnostic(

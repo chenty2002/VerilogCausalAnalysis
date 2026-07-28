@@ -813,6 +813,7 @@ def _append_interval(
     )
     identity = {
         "type": "persistent_interval",
+        "register_id": transition["register_id"],
         "subject_id": rule_id,
         "start_cycle": start_cycle,
         "end_cycle": end_cycle,

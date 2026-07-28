@@ -1,4 +1,4 @@
-"""Typed opt-in request contract for the C0-C5 Chisel semantic profile."""
+"""Typed opt-in request contract for the C0-C6 Chisel semantic profile."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ REQUEST_SCHEMA_V3 = "verilog_causal_request.v3"
 SEMANTIC_GRAPH_SCHEMA = "verilog_causal_semantic_graph.v1"
 CHISEL_PROFILE_VERSION = "chisel-semantic-profile.v1"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_C5_FEATURES = frozenset(
+_C6_FEATURES = frozenset(
     {
         "instance_graph",
         "endpoint_projection",
@@ -25,6 +25,7 @@ _C5_FEATURES = frozenset(
         "pipeline",
         "temporal_interval",
         "waitfor",
+        "source_provenance",
     }
 )
 
@@ -77,6 +78,7 @@ class FileArtifactV3:
         semantic_kinds = {
             "assertion_endpoint_projection",
             "reviewed_protocol_adapter",
+            "chisel_source_annotations",
         }
         if semantic and (
             not isinstance(kind, str) or kind not in semantic_kinds
@@ -184,11 +186,11 @@ class CausalAnalysisRequestV3:
             or profile_row["version"] != CHISEL_PROFILE_VERSION
             or not isinstance(features, list)
             or not features
-            or any(item not in _C5_FEATURES for item in features)
+            or any(item not in _C6_FEATURES for item in features)
         ):
             raise ContractV3Error(
-                "C0-C5 support only the explicit chisel profile features "
-                f"{sorted(_C5_FEATURES)}"
+                "C0-C6 support only the explicit chisel profile features "
+                f"{sorted(_C6_FEATURES)}"
             )
         canonical_features = tuple(sorted(set(features)))
         if "instance_graph" not in canonical_features:
@@ -296,10 +298,19 @@ class CausalAnalysisRequestV3:
             for item in semantic_inputs
             if item.kind == "reviewed_protocol_adapter"
         ]
-        if len(projection_inputs) > 1 or len(adapter_inputs) > 1:
+        annotation_inputs = [
+            item
+            for item in semantic_inputs
+            if item.kind == "chisel_source_annotations"
+        ]
+        if (
+            len(projection_inputs) > 1
+            or len(adapter_inputs) > 1
+            or len(annotation_inputs) > 1
+        ):
             raise ContractV3Error(
-                "at most one endpoint projection and one protocol adapter "
-                "are allowed"
+                "at most one endpoint projection, protocol adapter, and "
+                "source annotation artifact are allowed"
             )
         if (
             evidence_ref is not None
@@ -319,6 +330,10 @@ class CausalAnalysisRequestV3:
         if adapter_inputs and "waitfor" not in canonical_features:
             raise ContractV3Error(
                 "reviewed protocol adapter requires feature waitfor"
+            )
+        if annotation_inputs and "source_provenance" not in canonical_features:
+            raise ContractV3Error(
+                "source annotations require feature source_provenance"
             )
 
         required_bounds = {
@@ -435,6 +450,85 @@ def make_request_v3(**kwargs: Any) -> CausalAnalysisRequestV3:
             raise
     provisional["request_id"] = _computed_id_without_validation(provisional)
     return CausalAnalysisRequestV3.from_dict(provisional)
+
+
+def validate_semantic_graph_v3(value: Mapping[str, Any]) -> Dict[str, Any]:
+    """Validate the durable C6 graph envelope without reinterpreting evidence."""
+
+    _keys(
+        value,
+        {
+            "schema_version",
+            "graph_id",
+            "status",
+            "identity",
+            "endpoint",
+            "signal_nodes",
+            "semantic_nodes",
+            "edges",
+            "root_candidates",
+            "bounds",
+            "diagnostics",
+        },
+        "semantic_graph",
+    )
+    if value["schema_version"] != SEMANTIC_GRAPH_SCHEMA:
+        raise ContractV3Error("semantic graph schema is unsupported")
+    if value["status"] not in {"complete", "incomplete", "unsupported"}:
+        raise ContractV3Error("semantic graph status is invalid")
+    if not isinstance(value["graph_id"], str) or not value["graph_id"].startswith(
+        "vcsg_"
+    ):
+        raise ContractV3Error("semantic graph ID is invalid")
+    identity = value["identity"]
+    _keys(
+        identity,
+        {
+            "request_sha256",
+            "rtl_set_sha256",
+            "trace_sha256",
+            "analyzer_revision",
+            "profile_version",
+        },
+        "semantic_graph.identity",
+    )
+    for field in ("request_sha256", "rtl_set_sha256", "trace_sha256"):
+        _hash(identity[field], f"semantic_graph.identity.{field}")
+    if identity["profile_version"] != CHISEL_PROFILE_VERSION:
+        raise ContractV3Error("semantic graph profile version is invalid")
+    for field in (
+        "signal_nodes",
+        "semantic_nodes",
+        "edges",
+        "root_candidates",
+        "diagnostics",
+    ):
+        if not isinstance(value[field], list):
+            raise ContractV3Error(f"semantic_graph.{field} must be a list")
+    semantic_ids = [
+        row.get("semantic_id")
+        for row in value["semantic_nodes"]
+        if isinstance(row, Mapping)
+    ]
+    if len(semantic_ids) != len(set(semantic_ids)) or any(
+        not isinstance(item, str) or not item for item in semantic_ids
+    ):
+        duplicate_ids = sorted(
+            {
+                item
+                for item in semantic_ids
+                if isinstance(item, str) and semantic_ids.count(item) > 1
+            }
+        )[:8]
+        detail = (
+            f"; duplicate_ids={duplicate_ids}"
+            if duplicate_ids
+            else ""
+        )
+        raise ContractV3Error(
+            "semantic graph contains invalid semantic IDs" + detail
+        )
+    return dict(value)
 
 
 def _computed_id_without_validation(row: Mapping[str, Any]) -> str:

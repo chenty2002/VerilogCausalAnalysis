@@ -1,4 +1,4 @@
-"""C0-C5 execution for the explicit V3 Chisel profile."""
+"""C0-C6 execution for the explicit V3 Chisel profile."""
 
 from __future__ import annotations
 
@@ -37,6 +37,14 @@ from .waitfor_graph import (
     c5_enabled,
     load_protocol_adapter,
 )
+from .provenance import (
+    ProvenanceError,
+    build_provenance_hints,
+    c6_enabled,
+    load_source_annotations,
+)
+
+_MAX_RAW_SLICE_DEPTH = 256
 
 
 class _SemanticBoundaryProvider:
@@ -83,7 +91,9 @@ def _v2_request(request: CausalAnalysisRequestV3):
         clock_signal=request.clock_signal,
         endpoint_signal=request.endpoint.signal,
         endpoint_cycle=request.endpoint.cycle,
-        max_depth=request.bounds["max_signal_nodes"],
+        max_depth=min(
+            request.bounds["max_signal_nodes"], _MAX_RAW_SLICE_DEPTH
+        ),
         max_nodes=request.bounds["max_signal_nodes"],
         random_seed=request.random_seed,
         strict=request.strict,
@@ -98,24 +108,41 @@ def _identity(request: CausalAnalysisRequestV3) -> Dict[str, Any]:
         ),
         "trace_sha256": request.trace.sha256,
         "analyzer_revision": (
-            f"{ANALYZER_REVISION}+c5"
-            if c5_enabled(request.semantic_profile.features)
+            f"{ANALYZER_REVISION}+c6"
+            if c6_enabled(request.semantic_profile.features)
             else (
-                f"{ANALYZER_REVISION}+c4"
-                if c4_enabled(request.semantic_profile.features)
+                f"{ANALYZER_REVISION}+c5"
+                if c5_enabled(request.semantic_profile.features)
                 else (
-                    f"{ANALYZER_REVISION}+c3"
-                    if c3_enabled(request.semantic_profile.features)
+                    f"{ANALYZER_REVISION}+c4"
+                    if c4_enabled(request.semantic_profile.features)
                     else (
-                        f"{ANALYZER_REVISION}+c2"
-                        if c2_enabled(request.semantic_profile.features)
-                        else f"{ANALYZER_REVISION}+c1"
+                        f"{ANALYZER_REVISION}+c3"
+                        if c3_enabled(request.semantic_profile.features)
+                        else (
+                            f"{ANALYZER_REVISION}+c2"
+                            if c2_enabled(request.semantic_profile.features)
+                            else f"{ANALYZER_REVISION}+c1"
+                        )
                     )
                 )
             )
         ),
         "profile_version": CHISEL_PROFILE_VERSION,
     }
+
+
+def _session_identity(request: CausalAnalysisRequestV3) -> Dict[str, Any]:
+    """Identity of parser/waveform/normalization state reusable by endpoints."""
+
+    row = request.identity_dict()
+    row.pop("endpoint")
+    row["semantic_inputs"] = [
+        item
+        for item in row["semantic_inputs"]
+        if item.get("kind") != "assertion_endpoint_projection"
+    ]
+    return row
 
 
 def _empty_graph(
@@ -183,9 +210,58 @@ class PreparedCausalSessionV3:
             if (
                 c2_enabled(request.semantic_profile.features)
                 or c3_enabled(request.semantic_profile.features)
+                or c6_enabled(request.semantic_profile.features)
             )
             else None
         )
+        self._provenance_diagnostics: list[Dict[str, Any]] = []
+        if (
+            self._normalized_design is not None
+            and c6_enabled(request.semantic_profile.features)
+        ):
+            annotation = None
+            annotation_artifacts = [
+                item
+                for item in request.semantic_inputs
+                if item.kind == "chisel_source_annotations"
+            ]
+            try:
+                if annotation_artifacts:
+                    artifact = annotation_artifacts[0]
+                    annotation = load_source_annotations(
+                        artifact.path,
+                        sha256=artifact.sha256,
+                        bytes=artifact.bytes,
+                        rtl_set_sha256=_identity(request)["rtl_set_sha256"],
+                        known_statement_ids=set(
+                            self._prepared.parser._statement_evidence
+                        ),
+                    )
+                hints, self._provenance_diagnostics = build_provenance_hints(
+                    self.instance_graph,
+                    rtl_set_sha256=_identity(request)["rtl_set_sha256"],
+                    annotations=annotation,
+                )
+                self._normalized_design["provenance_hints"] = hints
+                self._normalized_design["diagnostics"].extend(
+                    self._provenance_diagnostics
+                )
+                self._normalized_design["normalized_design_id"] = stable_id(
+                    "vcnd_",
+                    {
+                        key: value
+                        for key, value in self._normalized_design.items()
+                        if key != "normalized_design_id"
+                    },
+                )
+            except ProvenanceError as error:
+                self._provenance_diagnostics = [
+                    {
+                        "code": "source_annotation_invalid",
+                        "message": str(error),
+                        "breaks_complete": True,
+                    }
+                ]
         if (
             self._normalized_design is not None
             and c3_enabled(request.semantic_profile.features)
@@ -242,8 +318,9 @@ class PreparedCausalSessionV3:
             request = self.request
         elif not isinstance(request, CausalAnalysisRequestV3):
             request = CausalAnalysisRequestV3.from_dict(request)
-        if request.request_sha256 != self.request.request_sha256:
-            raise ValueError("request does not match prepared V3 session")
+        if _session_identity(request) != _session_identity(self.request):
+            raise ValueError("request does not match prepared V3 session inputs")
+        current_v2 = _v2_request(request)
 
         diagnostics = [
             _diagnostic(
@@ -252,6 +329,10 @@ class PreparedCausalSessionV3:
             )
             for row in self.instance_graph.diagnostics
         ]
+        diagnostics.extend(
+            _diagnostic(row["code"], row["message"])
+            for row in self._provenance_diagnostics
+        )
         projection = None
         if request.endpoint.evidence_ref is not None:
             artifact = next(
@@ -317,11 +398,15 @@ class PreparedCausalSessionV3:
                 or re.sub(r"\s*\[\d+:\d+\]$", "", row["signal"])
                 in projection_members
             ]
+            # C2 register-transition objects own traversal across every
+            # recovered sequential boundary. Restricting this set to the
+            # endpoint projection lets unrelated registers expand once per
+            # cycle and makes the raw slice depend on Python recursion depth.
             provider = _SemanticBoundaryProvider(
                 provider,
                 {
                     re.sub(r"\s*\[\d+:\d+\]$", "", row["signal"])
-                    for row in selected_transitions
+                    for row in all_transitions
                 },
             )
         if not self._prepared.waveform.has_exact_signal(
@@ -346,7 +431,9 @@ class PreparedCausalSessionV3:
         slicer = BackwardSlicer(
             self._prepared.parser,
             self._prepared.waveform,
-            max_depth=request.bounds["max_signal_nodes"],
+            max_depth=min(
+                request.bounds["max_signal_nodes"], _MAX_RAW_SLICE_DEPTH
+            ),
             max_nodes=request.bounds["max_signal_nodes"],
             dependency_provider=provider,
         )
@@ -367,7 +454,7 @@ class PreparedCausalSessionV3:
             for key in sorted(ambiguity_by_identity)
         ]
         raw = _convert_graph(
-            self._v2,
+            current_v2,
             (node.to_dict() for node in nodes.values()),
             (edge.to_dict() for edge in edges),
             stats,
@@ -401,7 +488,10 @@ class PreparedCausalSessionV3:
                 seed_slicer = BackwardSlicer(
                     self._prepared.parser,
                     self._prepared.waveform,
-                    max_depth=request.bounds["max_signal_nodes"],
+                    max_depth=min(
+                        request.bounds["max_signal_nodes"],
+                        _MAX_RAW_SLICE_DEPTH,
+                    ),
                     max_nodes=request.bounds["max_signal_nodes"],
                     dependency_provider=provider,
                 )
@@ -409,7 +499,7 @@ class PreparedCausalSessionV3:
                     seed_signal, request.endpoint.cycle
                 )
                 seed_raw = _convert_graph(
-                    self._v2,
+                    current_v2,
                     (node.to_dict() for node in seed_nodes.values()),
                     (edge.to_dict() for edge in seed_edges),
                     dict(seed_slicer.get_statistics()),
@@ -554,6 +644,27 @@ class PreparedCausalSessionV3:
                         "inference_rule": transition["inference_rule"],
                     }
                 )
+            if c6_enabled(request.semantic_profile.features):
+                referenced_statement_ids = {
+                    str(statement_id)
+                    for row in semantic_nodes
+                    for statement_id in row.get("statement_ids", [])
+                }
+                hints = self._normalized_design["provenance_hints"]
+                selected_hints = [
+                    row
+                    for row in hints
+                    if not referenced_statement_ids
+                    or row["rtl_statement_id"] in referenced_statement_ids
+                ]
+                for hint in selected_hints:
+                    semantic_nodes.append(
+                        {
+                            **hint,
+                            "semantic_id": hint["hint_id"],
+                            "type": "source_provenance_hint",
+                        }
+                    )
             intervals, interval_diagnostics = persistent_intervals(
                 self._normalized_design,
                 self._prepared.waveform,
@@ -708,6 +819,9 @@ class PreparedCausalSessionV3:
                     == "1"
                 )
             ]
+            selected_aggregate_ids.update(
+                str(row["aggregate_id"]) for row in handshakes
+            )
             selected_pipeline_ids.update(
                 str(blocker["pipeline_id"])
                 for relation in blocking_relations
@@ -978,11 +1092,14 @@ class PreparedCausalSessionV3:
                     max_total_edges=request.bounds["max_edges"],
                 )
         semantic_nodes.sort(key=lambda row: row["semantic_id"])
-        all_diagnostics = raw["diagnostics"]
+        all_diagnostics = list(raw["diagnostics"])
         all_diagnostics.extend(interval_diagnostics)
         all_diagnostics.extend(c3_diagnostics)
         all_diagnostics.extend(temporal_diagnostics)
         all_diagnostics.extend(waitfor_diagnostics)
+        all_diagnostics = _classify_internal_waveform_frontiers(
+            all_diagnostics
+        )
         max_semantic_nodes_reached = (
             len(semantic_nodes) > request.bounds["max_semantic_nodes"]
         )
@@ -1068,6 +1185,17 @@ class PreparedCausalSessionV3:
         }
         if c5_enabled(request.semantic_profile.features):
             result_bounds["waitfor_work"] = waitfor_work
+        all_diagnostics = _aggregate_diagnostics(all_diagnostics)
+        result_bounds["waveform_frontiers"] = {
+            "exact_instance_missing": sum(
+                row["code"] == "waveform_exact_instance_missing"
+                for row in all_diagnostics
+            ),
+            "unknown_value": sum(
+                row["code"] == "waveform_value_unknown"
+                for row in all_diagnostics
+            ),
+        }
         result = {
             "schema_version": SEMANTIC_GRAPH_SCHEMA,
             "graph_id": stable_id("vcsg_", identity),
@@ -1087,10 +1215,7 @@ class PreparedCausalSessionV3:
             "edges": graph_edges,
             "root_candidates": root_candidates,
             "bounds": result_bounds,
-            "diagnostics": sorted(
-                all_diagnostics,
-                key=lambda row: (row["code"], row.get("message", "")),
-            ),
+            "diagnostics": all_diagnostics,
         }
         result["graph_id"] = stable_id(
             "vcsg_",
@@ -1126,6 +1251,86 @@ def prepare_causal_session_v3(
     top_module: Optional[str] = None,
 ) -> PreparedCausalSessionV3:
     return PreparedCausalSessionV3(request, top_module=top_module)
+
+
+def _classify_internal_waveform_frontiers(
+    diagnostics: list[Mapping[str, Any]],
+) -> list[Dict[str, Any]]:
+    """Keep internal waveform gaps explicit without failing the computation.
+
+    Endpoint identity and value are hard-gated before slicing. Internal X/Z
+    or absent exact-instance values terminate raw recursion and retain only
+    weak structural evidence, so they are coverage frontiers rather than an
+    unfinished analyzer operation.
+    """
+
+    result = []
+    for diagnostic in diagnostics:
+        row = dict(diagnostic)
+        if row.get("code") in {
+            "waveform_exact_instance_missing",
+            "waveform_value_unknown",
+        }:
+            row.update(
+                {
+                    "severity": "warning",
+                    "breaks_complete": False,
+                    "frontier": True,
+                }
+            )
+        result.append(row)
+    return result
+
+
+def _aggregate_diagnostics(
+    diagnostics: list[Mapping[str, Any]],
+) -> list[Dict[str, Any]]:
+    """Canonicalize repeated cycle diagnostics by semantic identity."""
+
+    grouped: Dict[tuple[Any, ...], Dict[str, Any]] = {}
+    counts: Dict[tuple[Any, ...], int] = {}
+    for raw in diagnostics:
+        row = dict(raw)
+        code = str(row.get("code"))
+        message = str(row.get("message", ""))
+        if code == "dependency_identity_ambiguous":
+            match = re.fullmatch(
+                r"signal (.+) at cycle [0-9]+ has ([0-9]+) waveform candidates",
+                message,
+            )
+            if match:
+                key = (code, match.group(1), int(match.group(2)))
+                row["message"] = (
+                    f"signal {match.group(1)} has {match.group(2)} waveform "
+                    "candidates across sampled cycles"
+                )
+            else:
+                key = (code, message)
+        elif code == "waveform_value_unknown":
+            match = re.fullmatch(
+                r"unknown value for signal (.+) at cycle [0-9]+", message
+            )
+            key = (code, match.group(1) if match else message)
+            if match:
+                row["message"] = (
+                    f"unknown values observed for signal {match.group(1)}"
+                )
+        else:
+            key = (
+                code,
+                message,
+                row.get("artifact_id"),
+                bool(row.get("breaks_complete")),
+            )
+        grouped.setdefault(key, row)
+        counts[key] = counts.get(key, 0) + 1
+    result = []
+    for key in sorted(grouped, key=lambda item: tuple(map(str, item))):
+        row = grouped[key]
+        if counts[key] > 1:
+            row["occurrence_count"] = counts[key]
+        result.append(row)
+    return result
 
 
 def build_causal_graph_v3(

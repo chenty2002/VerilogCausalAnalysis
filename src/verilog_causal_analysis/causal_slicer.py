@@ -707,7 +707,8 @@ class BackwardSlicer:
             "sva_trigger_cycle": None,
             "sva_time_window": None,  # (min_delay, max_delay) if SVA has time window
             "sva_window_end_cycle": None,  # The cycle when assertion failed (end of window)
-            "sva_consequent_signals": None  # Signals in the consequent part
+            "sva_consequent_signals": None,  # Signals in the consequent part
+            "exact_instance_waveform_misses": [],
         }
     
     @staticmethod
@@ -785,6 +786,20 @@ class BackwardSlicer:
                 hierarchy,
                 prefer_hierarchy=prefer_hierarchy,
             )
+            if (
+                self.instance_local_dependencies
+                and resolution.identity_strength == "basename_fallback"
+            ):
+                miss = {
+                    "signal": signal,
+                    "candidate_count": len(resolution.candidates),
+                }
+                rows = self.stats.setdefault(
+                    "exact_instance_waveform_misses", []
+                )
+                if miss not in rows:
+                    rows.append(miss)
+                return None, signal
             if resolution.ambiguous and getattr(
                 self.waveform, "exact_clock", False
             ):
@@ -1718,7 +1733,16 @@ class BackwardSlicer:
             
             # Update parent node suspect score
             parent_node.suspect_score = max(parent_node.suspect_score, score * 0.9)
-            
+
+            # An unknown value is an explicit waveform frontier. Continuing
+            # raw counterfactual recursion beyond it cannot recover dynamic
+            # causality and instead expands a large weak structural cone.
+            # Static/reversible membership remains available in the semantic
+            # layer, while the frontier node and its exact RTL edge stay in
+            # this graph.
+            if any(char in parent_node.value.lower() for char in ("x", "z")):
+                continue
+
             parents_to_recurse.append((parent_node, depth + 1))
 
         for parent_node, parent_depth in parents_to_recurse:
