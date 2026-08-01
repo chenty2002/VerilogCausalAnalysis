@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterable, Mapping, Optional
 from .identity import canonical_sha256, sha256_file, stable_id
 
 
-SOURCE_ANNOTATION_SCHEMA = "chisel_source_annotations.v1"
+SOURCE_ANNOTATION_SCHEMA = "chisel_source_annotations"
 SOURCE_PROVENANCE_FEATURE = "source_provenance"
 _LOCATOR_RE = re.compile(
     r"@\[(?P<path>[A-Za-z0-9_./-]+\.scala)\s+"
@@ -158,7 +158,7 @@ def build_provenance_hints(
                 reported_path=match.group("path"),
                 reported_locator=match.group("locator"),
                 status="unverified_hint",
-                inference_rule="firrtl_locator_comment.v1",
+                inference_rule="firrtl_locator_comment",
                 annotation_sha256=None,
             )
     if annotations is not None:
@@ -172,7 +172,7 @@ def build_provenance_hints(
                 reported_path=item["reported_path"],
                 reported_locator=item["reported_locator"],
                 status="source_projection_candidate",
-                inference_rule="hash_bound_annotation_sidecar.v1",
+                inference_rule="hash_bound_annotation_sidecar",
                 annotation_sha256=annotations["artifact_sha256"],
             )
     by_statement: Dict[str, set[tuple[str, str]]] = {}

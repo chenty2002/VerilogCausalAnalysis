@@ -1,4 +1,4 @@
-"""Canonical identities used by the deterministic V2 API."""
+"""Canonical identities used by the deterministic structural API."""
 
 from __future__ import annotations
 
@@ -9,12 +9,12 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 
-ANALYZER_REVISION = "verilog-causal-analysis-v2.3.0"
+ANALYZER_REVISION = "verilog-causal-analysis-current"
 HDLCONVERTOR_REVISION = "03c081a307850dc3c438df36592fc67b1ef6cfc0"
 
 
 def canonical_json_bytes(value: Any) -> bytes:
-    """Return the single canonical JSON representation used by V2 artifacts."""
+    """Return the single canonical JSON representation used by structural artifacts."""
     return json.dumps(
         value,
         sort_keys=True,

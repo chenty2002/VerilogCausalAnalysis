@@ -2,7 +2,7 @@
 
 This module deliberately consumes parser and instance identities rather than
 temporary-name heuristics alone.  The resulting objects are reusable for every
-endpoint in one prepared V3 session.
+endpoint in one prepared semantic session.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from .instance_graph import InstanceGraph
 from .verilog_parser import Dependency, DependencyType
 
 
-NORMALIZED_DESIGN_SCHEMA = "chisel_normalized_design.v1"
+NORMALIZED_DESIGN_SCHEMA = "chisel_normalized_design"
 _C2_FEATURES = frozenset(
     {"compiler_net_normalization", "register_transition"}
 )
@@ -174,7 +174,7 @@ def _alias_classes(
         known_widths = {widths[item] for item in members if widths.get(item)}
         identity = {
             "rtl_set_sha256": rtl_set_sha256,
-            "profile_version": "chisel-semantic-profile.v1",
+            "profile_version": "chisel-semantic-profile",
             "object_type": "alias_class",
             "members": members,
             "statement_ids": statement_ids,
@@ -188,7 +188,7 @@ def _alias_classes(
                 "evidence_statements": statement_ids,
                 "width": next(iter(known_widths)) if len(known_widths) == 1 else None,
                 "signed": None,
-                "inference_rule": "single_driver_pure_wire_alias.v1",
+                "inference_rule": "single_driver_pure_wire_alias",
             }
         )
     return sorted(result, key=lambda row: row["alias_id"])
@@ -249,7 +249,7 @@ def _expression_groups(
         )
         identity = {
             "rtl_set_sha256": rtl_set_sha256,
-            "profile_version": "chisel-semantic-profile.v1",
+            "profile_version": "chisel-semantic-profile",
             "object_type": "expression_group",
             "instance_path": instance_path,
             "target_signal": _qualify(instance_path, target),
@@ -274,7 +274,7 @@ def _expression_groups(
                 ],
                 "statement_ids": sorted(statements),
                 "provenance_hint_ids": [],
-                "inference_rule": "pure_combinational_temporary_dag.v1",
+                "inference_rule": "pure_combinational_temporary_dag",
             }
         )
     return sorted(groups, key=lambda row: row["expression_id"])
@@ -441,7 +441,7 @@ def _register_transitions(
                 "value_members": [_qualify(instance_path, target)],
                 "update_kind": "hold",
                 "statement_ids": [],
-                "inference_rule": "implicit_sequential_hold.v1",
+                "inference_rule": "implicit_sequential_hold",
             }
         width = None
         module_name = graph.resolve_signal(
@@ -452,7 +452,7 @@ def _register_transitions(
             width = info.width if info is not None else None
         identity = {
             "rtl_set_sha256": rtl_set_sha256,
-            "profile_version": "chisel-semantic-profile.v1",
+            "profile_version": "chisel-semantic-profile",
             "object_type": "register_transition",
             "instance_path": instance_path,
             "signal": _qualify(instance_path, target),
@@ -483,7 +483,7 @@ def _register_transitions(
                     and width is not None
                     else None
                 ),
-                "inference_rule": "sequential_assignment_rules.v1",
+                "inference_rule": "sequential_assignment_rules",
             }
         )
     return sorted(result, key=lambda row: row["register_id"])
@@ -523,7 +523,7 @@ def build_normalized_design(
     payload = {
         "schema_version": NORMALIZED_DESIGN_SCHEMA,
         "rtl_set_sha256": rtl_set_sha256,
-        "profile_version": "chisel-semantic-profile.v1",
+        "profile_version": "chisel-semantic-profile",
         "features": sorted(features),
         "instances": graph.to_dict()["instances"],
         "alias_classes": aliases,
@@ -611,7 +611,7 @@ def get_raw_members(
             "raw member expansion exceeds max_members"
         )
     result = {
-        "schema_version": "chisel_raw_members_query.v1",
+        "schema_version": "chisel_raw_members_query",
         "normalized_design_id": normalized_design[
             "normalized_design_id"
         ],
@@ -642,7 +642,7 @@ def get_register_transition(
             "register_id is absent from normalized design"
         )
     result = {
-        "schema_version": "chisel_register_transition_query.v1",
+        "schema_version": "chisel_register_transition_query",
         "normalized_design_id": normalized_design[
             "normalized_design_id"
         ],
@@ -839,6 +839,6 @@ def _append_interval(
             },
             "observation": observation,
             "dynamic_score": 1.0 if observation == "fully_observed" else 0.0,
-            "inference_rule": "persistent_update_rule_interval.v1",
+            "inference_rule": "persistent_update_rule_interval",
         }
     )

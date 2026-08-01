@@ -1,4 +1,4 @@
-"""Bounded stable-ID queries over C3-C6 semantic graphs."""
+"""Stable-ID queries over current semantic graphs."""
 
 from __future__ import annotations
 
@@ -23,25 +23,20 @@ def _node(graph: Mapping[str, Any], semantic_id: str, types: set[str]) -> Dict[s
 
 
 def _result(schema: str, graph: Mapping[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
-    row = {
-        "schema_version": schema,
-        "graph_id": graph["graph_id"],
-        **payload,
-    }
+    row = {"schema_version": schema, "graph_id": graph["graph_id"], **payload}
     row["result_sha256"] = canonical_sha256(row)
     return row
 
 
-def get_semantic_overview(
-    graph: Mapping[str, Any], *, top_k: int
-) -> Dict[str, Any]:
+def get_semantic_overview(graph: Mapping[str, Any], *, top_k: int) -> Dict[str, Any]:
     if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
         raise SemanticGraphQueryError("top_k must be positive")
     counts: Dict[str, int] = {}
     for row in graph.get("semantic_nodes", []):
-        counts[str(row.get("type"))] = counts.get(str(row.get("type")), 0) + 1
+        key = str(row.get("type"))
+        counts[key] = counts.get(key, 0) + 1
     return _result(
-        "chisel_semantic_overview_query.v1",
+        "chisel_semantic_overview_query",
         graph,
         {
             "status": graph.get("status"),
@@ -55,34 +50,19 @@ def get_semantic_overview(
 def get_interval_evidence(
     graph: Mapping[str, Any], interval_ids: list[str]
 ) -> Dict[str, Any]:
-    if (
-        not isinstance(interval_ids, list)
-        or not interval_ids
-        or any(not isinstance(item, str) or not item for item in interval_ids)
-        or len(interval_ids) != len(set(interval_ids))
-    ):
+    if not interval_ids or len(interval_ids) != len(set(interval_ids)):
         raise SemanticGraphQueryError("interval_ids must be non-empty and unique")
     rows = [
-        _node(
-            graph,
-            item,
-            {"persistent_interval", "stall_interval", "pipeline_occupancy"},
-        )
+        _node(graph, item, {"persistent_interval", "stall_interval", "pipeline_occupancy"})
         for item in sorted(interval_ids)
     ]
-    return _result(
-        "chisel_interval_evidence_query.v1", graph, {"intervals": rows}
-    )
+    return _result("chisel_interval_evidence_query", graph, {"intervals": rows})
 
 
 def get_handshake_timeline(
     graph: Mapping[str, Any], handshake_id: str, *, max_events: int
 ) -> Dict[str, Any]:
-    if (
-        isinstance(max_events, bool)
-        or not isinstance(max_events, int)
-        or max_events <= 0
-    ):
+    if isinstance(max_events, bool) or not isinstance(max_events, int) or max_events <= 0:
         raise SemanticGraphQueryError("max_events must be positive")
     handshake = _node(graph, handshake_id, {"handshake"})
     events = sorted(
@@ -98,7 +78,7 @@ def get_handshake_timeline(
         ),
     )[:max_events]
     return _result(
-        "chisel_handshake_timeline_query.v1",
+        "chisel_handshake_timeline_query",
         graph,
         {"handshake": handshake, "events": events, "max_events": max_events},
     )
@@ -130,7 +110,7 @@ def get_pipeline_occupancy(
         and row.get("end_cycle", start_cycle - 1) >= start_cycle
     ]
     return _result(
-        "chisel_pipeline_occupancy_query.v1",
+        "chisel_pipeline_occupancy_query",
         graph,
         {
             "pipeline": pipeline,

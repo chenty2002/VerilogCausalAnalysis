@@ -17,7 +17,7 @@ from .verilog_parser import (
 )
 
 
-ASSERTION_PROJECTION_SCHEMA = "assertion_endpoint_projection.v1"
+ASSERTION_PROJECTION_SCHEMA = "assertion_endpoint_projection"
 
 
 class EndpointProjectionError(ValueError):

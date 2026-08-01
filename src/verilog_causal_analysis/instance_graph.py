@@ -24,7 +24,7 @@ from .verilog_parser import (
 )
 
 
-INSTANCE_GRAPH_SCHEMA = "verilog_instance_graph.v1"
+INSTANCE_GRAPH_SCHEMA = "verilog_instance_graph"
 
 
 @dataclass(frozen=True)
@@ -343,7 +343,7 @@ class InstanceGraph:
                         "instance_path": hierarchy,
                         "module_name": module_name,
                         "inference_rule": (
-                            "exact_waveform_scope_module_signature.v1"
+                            "exact_waveform_scope_module_signature"
                         ),
                     },
                     length=24,
@@ -376,7 +376,7 @@ class InstanceGraph:
                 {
                     "instance_path": hierarchy,
                     "module_name": module_name,
-                    "inference_rule": "exact_waveform_scope_module_signature.v1",
+                    "inference_rule": "exact_waveform_scope_module_signature",
                 },
                 length=24,
             )

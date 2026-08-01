@@ -21,13 +21,13 @@ _TYPE_PRIORITY = {
     "last_progress_event": 6,
 }
 _SEED_PRIORITY = {
-    "predicate_counter_operand.v1": 0,
-    "threshold_crossing.v1": 1,
-    "persistent_active_guard.v1": 2,
-    "missing_expected_completion.v1": 3,
-    "overlapping_stall.v1": 4,
-    "persistent_pipeline_blocker.v1": 5,
-    "last_progress_predecessor.v1": 6,
+    "predicate_counter_operand": 0,
+    "threshold_crossing": 1,
+    "persistent_active_guard": 2,
+    "missing_expected_completion": 3,
+    "overlapping_stall": 4,
+    "persistent_pipeline_blocker": 5,
+    "last_progress_predecessor": 6,
 }
 
 
@@ -331,7 +331,7 @@ def build_c4_temporal_layer(
         register_id = str(register["semantic_id"])
         add_seed(
             register_id,
-            "predicate_counter_operand.v1",
+            "predicate_counter_operand",
             cycle=endpoint_cycle,
             evidence_refs=sorted(predicate_ids),
         )
@@ -397,12 +397,12 @@ def build_c4_temporal_layer(
                 "boundary_transitions": [dict(crossing)],
                 "unknown_spans": series["unknown_spans"],
                 "evidence_strength": "transition_supported",
-                "inference_rule": "observed_counter_threshold_crossing.v1",
+                "inference_rule": "observed_counter_threshold_crossing",
             }
             temporal_nodes.append(crossing_node)
             add_seed(
                 crossing_id,
-                "threshold_crossing.v1",
+                "threshold_crossing",
                 cycle=int(crossing["cycle"]),
                 evidence_refs=[register_id],
             )
@@ -428,7 +428,7 @@ def build_c4_temporal_layer(
         interval_id = str(interval["semantic_id"])
         add_seed(
             interval_id,
-            "persistent_active_guard.v1",
+            "persistent_active_guard",
             interval=[int(interval["start_cycle"]), int(interval["end_cycle"])],
             evidence_refs=[
                 str(interval["register_id"]),
@@ -463,12 +463,12 @@ def build_c4_temporal_layer(
                 **identity,
                 "evidence_refs": [interval_id, *completion_rule_ids],
                 "evidence_strength": "interval_rule_derived",
-                "inference_rule": "persistent_counter_without_completion.v1",
+                "inference_rule": "persistent_counter_without_completion",
             }
         )
         add_seed(
             missing_id,
-            "missing_expected_completion.v1",
+            "missing_expected_completion",
             interval=[int(interval["start_cycle"]), endpoint_cycle],
             evidence_refs=[interval_id, *completion_rule_ids],
             identity_strength="derived",
@@ -520,7 +520,7 @@ def build_c4_temporal_layer(
     for stall in sorted(stalls, key=lambda row: row["semantic_id"]):
         add_seed(
             str(stall["semantic_id"]),
-            "overlapping_stall.v1",
+            "overlapping_stall",
             interval=[
                 max(failure_start, int(stall["start_cycle"])),
                 min(endpoint_cycle, int(stall["end_cycle"])),
@@ -534,7 +534,7 @@ def build_c4_temporal_layer(
         for row in nodes
         if row["type"] == "blocking_relation"
         and str(row.get("inference_rule", "")).startswith(
-            "exact_waveform_scope_module_signature.v1+"
+            "exact_waveform_scope_module_signature+"
         )
     ]
     pipeline_stage_valids = {
@@ -591,7 +591,7 @@ def build_c4_temporal_layer(
         )
         add_seed(
             str(blocker["semantic_id"]),
-            "persistent_pipeline_blocker.v1",
+            "persistent_pipeline_blocker",
             interval=[failure_start, endpoint_cycle],
             evidence_refs=[
                 str(item["pipeline_id"])
@@ -641,12 +641,12 @@ def build_c4_temporal_layer(
                 "semantic_id": progress_id,
                 **identity,
                 "evidence_strength": "transition_supported",
-                "inference_rule": "latest_observed_progress.v1",
+                "inference_rule": "latest_observed_progress",
             }
         )
         add_seed(
             progress_id,
-            "last_progress_predecessor.v1",
+            "last_progress_predecessor",
             cycle=progress_cycle,
             evidence_refs=[source_id],
         )
@@ -683,7 +683,7 @@ def build_c4_temporal_layer(
     deferred_blockers: list[Dict[str, Any]] = []
     retained_pipeline_components: set[Tuple[str, ...]] = set()
     for row in ordered_seeds:
-        if row["derivation_rule"] == "persistent_pipeline_blocker.v1":
+        if row["derivation_rule"] == "persistent_pipeline_blocker":
             component = (str(row["component_identity"]),)
             if component in retained_pipeline_components:
                 deferred_blockers.append(row)
@@ -836,7 +836,7 @@ def get_semantic_paths(
         and len(row["semantic_path"]) - 1 <= max_length
     ][:max_paths]
     result = {
-        "schema_version": "chisel_semantic_paths_query.v1",
+        "schema_version": "chisel_semantic_paths_query",
         "graph_id": graph["graph_id"],
         "target_id": target_id,
         "paths": rows,

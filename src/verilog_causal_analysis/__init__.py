@@ -1,19 +1,24 @@
-"""Public production surface for Verilog Causal Analysis V2/V3.
-
-Auto-detection remains available only to :mod:`verilog_causal_analysis.cli`
-through the private diagnostic module and is intentionally not re-exported.
-"""
+"""Public API for structural baselines and the current Chisel-aware analysis."""
 
 from .contracts import (
-    CausalAnalysisRequestV2,
-    ContractError,
-    EVIDENCE_STRENGTHS,
+    CHISEL_PROFILE,
     GRAPH_SCHEMA,
+    REQUEST_SCHEMA,
+    CausalAnalysisRequest,
+    ContractError,
+    make_request,
+    validate_graph,
+)
+from .structural_contract import (
+    EVIDENCE_STRENGTHS,
     GRAPH_STATUSES,
     IDENTITY_STRENGTHS,
-    REQUEST_SCHEMA,
-    make_request_v2,
-    validate_graph_v2,
+    STRUCTURAL_GRAPH_SCHEMA,
+    STRUCTURAL_REQUEST_SCHEMA,
+    StructuralCausalRequest,
+    StructuralContractError,
+    make_structural_request,
+    validate_structural_graph,
 )
 from .identity import (
     ANALYZER_REVISION,
@@ -21,15 +26,6 @@ from .identity import (
     canonical_json_bytes,
     canonical_sha256,
     sha256_file,
-)
-from .contracts_v3 import (
-    CHISEL_PROFILE_VERSION,
-    CausalAnalysisRequestV3,
-    ContractV3Error,
-    REQUEST_SCHEMA_V3,
-    SEMANTIC_GRAPH_SCHEMA,
-    make_request_v3,
-    validate_semantic_graph_v3,
 )
 from .endpoint_projection import (
     ASSERTION_PROJECTION_SCHEMA,
@@ -48,16 +44,6 @@ from .chisel_semantics import (
     SemanticQueryError,
     get_raw_members,
     get_register_transition,
-)
-from .query import (
-    GraphQueryView,
-    QueryError,
-    expand_predecessors,
-    get_edge_evidence,
-    get_overview,
-    get_query_cache_statistics,
-    get_ranked_paths,
-    prepare_query_view,
 )
 from .temporal_semantics import (
     TEMPORAL_FEATURE,
@@ -88,96 +74,88 @@ from .semantic_query import (
 __version__ = "2.3.0"
 
 
-def build_causal_graph_v2(request):
-    """Lazily load the parser/waveform backend for a production build."""
-    from .engine import build_causal_graph_v2 as _build
+def build_structural_graph(request):
+    """Build the structural baseline graph."""
+    from .structural_engine import build_structural_graph as build
 
-    return _build(request)
-
-
-def prepare_causal_analysis(request):
-    """Prepare verified RTL/waveform state for multiple V2 graph builds."""
-    from .engine import prepare_causal_analysis as _prepare
-
-    return _prepare(request)
+    return build(request)
 
 
-def build_causal_graph_v3(request, *, top_module=None):
-    """Build one opt-in C0-C6 Chisel semantic graph."""
-    from .engine_v3 import build_causal_graph_v3 as _build
+def prepare_structural_analysis(request):
+    """Prepare shared state for structural baseline queries."""
+    from .structural_engine import prepare_structural_analysis as prepare
 
-    return _build(request, top_module=top_module)
+    return prepare(request)
 
 
-def prepare_causal_session_v3(request, *, top_module=None):
-    """Prepare a reusable C0-C6 Chisel semantic session."""
-    from .engine_v3 import prepare_causal_session_v3 as _prepare
+def build_causal_graph(request, *, top_module=None):
+    """Build the current Chisel-aware causal graph."""
+    from .engine import build_causal_graph as build
 
-    return _prepare(request, top_module=top_module)
+    return build(request, top_module=top_module)
+
+
+def prepare_causal_session(request, *, top_module=None):
+    """Prepare shared state for Chisel-aware causal queries."""
+    from .engine import prepare_causal_session as prepare
+
+    return prepare(request, top_module=top_module)
 
 
 __all__ = [
     "ANALYZER_REVISION",
     "ASSERTION_PROJECTION_SCHEMA",
     "AssertionEndpointProjection",
-    "CHISEL_PROFILE_VERSION",
-    "CausalAnalysisRequestV2",
-    "CausalAnalysisRequestV3",
+    "CHISEL_PROFILE",
+    "CausalAnalysisRequest",
     "ContractError",
-    "ContractV3Error",
     "EVIDENCE_STRENGTHS",
+    "EndpointProjectionError",
     "GRAPH_SCHEMA",
     "GRAPH_STATUSES",
-    "GraphQueryView",
     "HDLCONVERTOR_REVISION",
     "IDENTITY_STRENGTHS",
     "INSTANCE_GRAPH_SCHEMA",
-    "NORMALIZED_DESIGN_SCHEMA",
     "InstanceGraph",
     "InstanceGraphError",
     "InstanceNode",
-    "EndpointProjectionError",
-    "PortBinding",
+    "NORMALIZED_DESIGN_SCHEMA",
     "PROTOCOL_ADAPTER_SCHEMA",
-    "QueryError",
+    "PortBinding",
+    "ProvenanceError",
     "REQUEST_SCHEMA",
-    "REQUEST_SCHEMA_V3",
-    "SEMANTIC_GRAPH_SCHEMA",
+    "SOURCE_ANNOTATION_SCHEMA",
+    "SOURCE_PROVENANCE_FEATURE",
+    "STRUCTURAL_GRAPH_SCHEMA",
+    "STRUCTURAL_REQUEST_SCHEMA",
+    "SemanticQueryError",
+    "SemanticGraphQueryError",
+    "StructuralCausalRequest",
+    "StructuralContractError",
     "TEMPORAL_FEATURE",
     "WAITFOR_FEATURE",
     "WaitForError",
-    "SemanticQueryError",
-    "SemanticGraphQueryError",
-    "SOURCE_ANNOTATION_SCHEMA",
-    "SOURCE_PROVENANCE_FEATURE",
-    "ProvenanceError",
-    "build_causal_graph_v2",
-    "build_causal_graph_v3",
+    "build_causal_graph",
+    "build_structural_graph",
+    "build_transition_intervals",
     "canonical_json_bytes",
     "canonical_sha256",
-    "expand_predecessors",
-    "get_edge_evidence",
-    "get_overview",
-    "get_query_cache_statistics",
-    "get_ranked_paths",
-    "get_semantic_paths",
-    "get_semantic_overview",
-    "get_interval_evidence",
-    "get_handshake_timeline",
-    "get_pipeline_occupancy",
-    "get_waitfor_component",
     "get_raw_members",
     "get_register_transition",
-    "make_request_v2",
-    "make_request_v3",
+    "get_handshake_timeline",
+    "get_interval_evidence",
+    "get_pipeline_occupancy",
+    "get_semantic_overview",
+    "get_semantic_paths",
+    "get_waitfor_component",
     "make_protocol_adapter",
-    "prepare_causal_analysis",
-    "prepare_causal_session_v3",
-    "prepare_query_view",
-    "build_transition_intervals",
+    "make_request",
+    "make_structural_request",
+    "prepare_causal_session",
+    "prepare_structural_analysis",
     "sha256_file",
-    "validate_graph_v2",
-    "validate_semantic_graph_v3",
+    "validate_graph",
     "validate_protocol_adapter",
+    "validate_structural_graph",
     "__version__",
 ]

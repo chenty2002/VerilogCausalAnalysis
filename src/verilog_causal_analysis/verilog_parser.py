@@ -312,11 +312,7 @@ class DependencyIndex:
             return True
         if "." in clean_signal and clean_signal.endswith("." + arc.target_clean):
             return True
-        if module_name and arc.module_name and arc.module_name != module_name:
-            return False
-        if module_name and arc.target_base == base_signal:
-            return True
-        return arc.target_base == base_signal and not module_name
+        return False
 
     @staticmethod
     def _identity_strength(
@@ -327,7 +323,7 @@ class DependencyIndex:
             return "exact"
         if "." in clean_signal and clean_signal.endswith("." + arc.target_clean):
             return "hierarchy_inferred"
-        return "basename_fallback"
+        return "unresolved"
 
     def lookup(
         self,
@@ -340,7 +336,6 @@ class DependencyIndex:
         candidate_ordinals.update(self._by_target_qualified.get(clean, ()))
         for suffix in self._suffixes(clean):
             candidate_ordinals.update(self._by_target_clean.get(suffix, ()))
-        candidate_ordinals.update(self._by_target_base.get(base, ()))
 
         matched: List[_IndexedDependencyArc] = []
         strengths: List[str] = []
@@ -351,7 +346,7 @@ class DependencyIndex:
                 strengths.append(self._identity_strength(arc, clean))
 
         strength = "unresolved"
-        for candidate in ("exact", "hierarchy_inferred", "basename_fallback"):
+        for candidate in ("exact", "hierarchy_inferred"):
             if candidate in strengths:
                 strength = candidate
                 break
@@ -447,7 +442,7 @@ class VerilogParser:
         self.instance_module_map: Dict[str, Set[str]] = {}
         self.file_contents: Dict[str, str] = {}
         self.file_lines: Dict[str, List[str]] = {}
-        # SVA assertion pattern (fallback when hdlConvertor skips)
+        # SVA assertion extraction, which hdlConvertor does not expose.
         self._re_assert_label = re.compile(
             r'^\s*(\w+)\s*:\s*assert\s+property\s*\(@\([^)]+\)\s*'
             r'(?:disable\s+iff\s*\([^)]+\)\s*)?(.+?)\)',
@@ -475,7 +470,7 @@ class VerilogParser:
             sanitized.append(line)
 
         if not sanitized:
-            sanitized = lines  # Fallback: nothing matched
+            sanitized = lines
 
         # Remove trailing resource filenames (e.g., "ResetCounter.sv")
         while sanitized and self._looks_like_file_ref(sanitized[-1]):
@@ -1463,7 +1458,7 @@ class VerilogParser:
                 }
             )
         return {
-            "schema_version": "parsed_design_cache.v2",
+            "schema_version": "parsed_design_cache",
             "modules": modules,
             "statements": [
                 statements[statement_id]
@@ -1481,7 +1476,7 @@ class VerilogParser:
         strict: bool = True,
     ) -> "VerilogParser":
         """Restore a validated path-free prepared-design payload."""
-        if payload.get("schema_version") != "parsed_design_cache.v2":
+        if payload.get("schema_version") != "parsed_design_cache":
             raise ValueError("unsupported parsed-design cache schema")
         parser = cls(strict=strict)
 

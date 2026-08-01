@@ -50,7 +50,7 @@ def _object_id(
         prefix,
         {
             "rtl_set_sha256": rtl_set_sha256,
-            "profile_version": "chisel-semantic-profile.v1",
+            "profile_version": "chisel-semantic-profile",
             "object_type": object_type,
             "instance_path": instance_path,
             "members": sorted(set(members)),
@@ -168,7 +168,7 @@ def build_c3_semantics(
                 "members": member_rows,
                 "member_signals": sorted(members),
                 "identity_strength": identity_strength,
-                "inference_rule": "exact_instance_flattened_fields.v1",
+                "inference_rule": "exact_instance_flattened_fields",
                 "statement_ids": statement_ids,
             }
             aggregates.append(aggregate)
@@ -205,7 +205,7 @@ def build_c3_semantics(
                         "member_signals": sorted(members),
                         "identity_strength": "exact_rtl_members",
                         "statement_ids": statement_ids,
-                        "inference_rule": "instance_local_ready_valid.v1",
+                        "inference_rule": "instance_local_ready_valid",
                     }
                 )
 
@@ -232,7 +232,7 @@ def build_c3_semantics(
                     ],
                     "member_signals": sorted(members),
                     "identity_strength": "inferred_shape",
-                    "inference_rule": "flattened_vec_shape.v1",
+                    "inference_rule": "flattened_vec_shape",
                     "statement_ids": sorted(
                         {
                             statement
@@ -272,7 +272,7 @@ def build_c3_semantics(
                     ],
                     "member_signals": sorted(members),
                     "identity_strength": "inferred_shape",
-                    "inference_rule": "flattened_port_record_shape.v1",
+                    "inference_rule": "flattened_port_record_shape",
                     "statement_ids": sorted(
                         {
                             statement
@@ -376,7 +376,7 @@ def build_c3_semantics(
                             for statement in transfer["statement_ids"]
                         }
                     ),
-                    "inference_rule": "stage_shape_sequential_transfer.v1",
+                    "inference_rule": "stage_shape_sequential_transfer",
                 }
             )
 
@@ -472,7 +472,7 @@ def build_c3_semantics(
                         "expression": expression,
                         "statement_ids": sorted(statement_ids),
                         "identity_strength": "exact_rtl_expression",
-                        "inference_rule": "pipeline_member_combinational_blocker.v1",
+                        "inference_rule": "pipeline_member_combinational_blocker",
                     }
                 )
 
@@ -565,7 +565,7 @@ def project_c3_waveform_scope(
         aggregate_ids[source["aggregate_id"]] = projected_id
         projected["aggregate_id"] = projected_id
         projected["inference_rule"] = (
-            "exact_waveform_scope_module_signature.v1+"
+            "exact_waveform_scope_module_signature+"
             + projected["inference_rule"]
         )
 
@@ -595,7 +595,7 @@ def project_c3_waveform_scope(
         handshake_ids[source["handshake_id"]] = projected_id
         projected["handshake_id"] = projected_id
         projected["inference_rule"] = (
-            "exact_waveform_scope_module_signature.v1+"
+            "exact_waveform_scope_module_signature+"
             + projected["inference_rule"]
         )
 
@@ -628,7 +628,7 @@ def project_c3_waveform_scope(
         pipeline_ids[source["pipeline_id"]] = projected_id
         projected["pipeline_id"] = projected_id
         projected["inference_rule"] = (
-            "exact_waveform_scope_module_signature.v1+"
+            "exact_waveform_scope_module_signature+"
             + projected["inference_rule"]
         )
 
@@ -659,7 +659,7 @@ def project_c3_waveform_scope(
             projected["expression"],
         )
         projected["inference_rule"] = (
-            "exact_waveform_scope_module_signature.v1+"
+            "exact_waveform_scope_module_signature+"
             + projected["inference_rule"]
         )
 
@@ -679,7 +679,7 @@ def project_c3_waveform_scope(
             "code": "waveform_scope_semantics_projected",
             "instance_path": target_path,
             "module_name": resolution.module_name,
-            "inference_rule": "exact_waveform_scope_module_signature.v1",
+            "inference_rule": "exact_waveform_scope_module_signature",
         }
     )
     identity_payload = {
@@ -855,6 +855,6 @@ def _append_stall(
             "payload_identity": identity["payload_identity"],
             "last_accept_cycle": last_accept_cycle,
             "evidence_strength": "fully_observed",
-            "inference_rule": "exact_ready_valid_stall_interval.v1",
+            "inference_rule": "exact_ready_valid_stall_interval",
         }
     )

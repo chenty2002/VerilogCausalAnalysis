@@ -637,7 +637,6 @@ class BackwardSlicer:
                  max_nodes: int = 200,
                  *,
                  exact_sva_trigger_cycle: Optional[int] = None,
-                 allow_heuristic_sva_trigger: bool = False,
                  dependency_provider: Optional[Any] = None,
                  ):
         """Initialize backward slicer with RTL parser and waveform data."""
@@ -647,7 +646,7 @@ class BackwardSlicer:
         self.waveform = waveform
         self.max_depth = max_depth
         self.max_nodes = max_nodes
-        # V2.2 derives deterministic work limits from max_nodes.  In
+        # structural.2 derives deterministic work limits from max_nodes.  In
         # particular, none of these limits expands when max_depth changes.
         self.weak_edge_budget = max(0, (max_nodes - 1) // 4)
         self.weak_beam_width = 2
@@ -655,7 +654,6 @@ class BackwardSlicer:
         self.temporal_lookback_budget = max(64, max_nodes * 8)
         self.temporal_value_budget = max(256, max_nodes * 32)
         self.exact_sva_trigger_cycle = exact_sva_trigger_cycle
-        self.allow_heuristic_sva_trigger = allow_heuristic_sva_trigger
         self.dep_graph = verilog_parser.build_dependency_graph()
         self._signal_sources_cache: Dict[str, List[str]] = {}
         self._statement_evaluation_cache: Dict[
@@ -778,7 +776,7 @@ class BackwardSlicer:
                               match_cache: Optional[Dict[str, List[str]]] = None,
                               prefer_hierarchy: bool = True
                               ) -> Tuple[Optional[str], str]:
-        """Resolve signal value with hierarchy and partial-match fallbacks."""
+        """Resolve a signal value using exact or normalized hierarchy identity."""
         resolver = getattr(self.waveform, "resolve_signal", None)
         if callable(resolver):
             resolution = resolver(
@@ -786,20 +784,6 @@ class BackwardSlicer:
                 hierarchy,
                 prefer_hierarchy=prefer_hierarchy,
             )
-            if (
-                self.instance_local_dependencies
-                and resolution.identity_strength == "basename_fallback"
-            ):
-                miss = {
-                    "signal": signal,
-                    "candidate_count": len(resolution.candidates),
-                }
-                rows = self.stats.setdefault(
-                    "exact_instance_waveform_misses", []
-                )
-                if miss not in rows:
-                    rows.append(miss)
-                return None, signal
             if resolution.ambiguous and getattr(
                 self.waveform, "exact_clock", False
             ):
@@ -813,8 +797,6 @@ class BackwardSlicer:
                     rows.append(ambiguity)
                 return None, signal
             resolved_signal = resolution.resolved_signal
-            if resolved_signal is None and resolution.candidates:
-                resolved_signal = resolution.candidates[0]
             if resolved_signal is not None:
                 value = self.waveform.get_signal_value(
                     resolved_signal, cycle
@@ -1001,84 +983,9 @@ class BackwardSlicer:
                 return None
             self.stats["sva_trigger_evidence"] = "exact"
             return self.exact_sva_trigger_cycle
-        if not self.allow_heuristic_sva_trigger:
-            # Production V2 has no hash-bound exact trigger field. Do not
-            # promote an RTL/FST heuristic to branch-observed authority.
-            self.stats["sva_trigger_evidence"] = "missing_exact"
-            self.stats["sva_exact_trigger_missing"] = True
-            return None
-        self.stats["sva_trigger_evidence"] = "diagnostic_heuristic"
-        
-        # Build a signal resolution cache for faster lookup
-        signal_cache: Dict[str, str] = {}  # short_name -> resolved_full_name
-        for src in sorted(sources):
-            full_src = f"{hierarchy}.{src}" if hierarchy else src
-            # Try to find the actual signal in waveform (may have width suffix)
-            matches = self.waveform.find_signal(src, max_results=5)
-            for m in matches:
-                # Prefer signals in the correct hierarchy
-                if hierarchy and m.startswith(hierarchy + '.'):
-                    signal_cache[src] = m
-                    break
-                elif not hierarchy and src in m:
-                    signal_cache[src] = m
-                    break
-            if src not in signal_cache:
-                signal_cache[src] = full_src  # Fallback to constructed name
-        
-        # For time-windowed assertions, the trigger is at max_cycle - max_delay
-        # We scan from that point backward to find where antecedent became true
-        search_start = max_cycle
-        if max_delay is not None:
-            search_start = max_cycle - max_delay
-        
-        # First, find the actual trigger cycle by scanning backward from search_start
-        # to find where antecedent FIRST became true (before staying true)
-        trigger_cycle = None
-        last_true_cycle = None
-        
-        search_floor = max(
-            0, search_start - self.temporal_lookback_budget + 1
-        )
-        for cycle in range(search_start, search_floor - 1, -1):
-            env = {}
-            for src in sorted(sources):
-                if (
-                    self.stats["temporal_values_loaded"]
-                    >= self.temporal_value_budget
-                ):
-                    self.stats["temporal_work_budget_reached"] = True
-                    return None
-                resolved_sig = signal_cache.get(src, src)
-                val = self.waveform.get_signal_value(resolved_sig, cycle)
-                self.stats["temporal_values_loaded"] += 1
-                if val:
-                    # Add both short and full name to environment
-                    env[src] = val
-                    # Also add without underscore prefix if applicable
-                    if src.startswith('_'):
-                        env[src[1:]] = val
-            
-            # Evaluate antecedent
-            evaluator = ExpressionEvaluator(env)
-            result = evaluator.evaluate(antecedent)
-            self.stats["temporal_cycles_evaluated"] += 1
-            
-            if result and evaluator._is_true(result):
-                last_true_cycle = cycle
-            else:
-                # Antecedent is false, so the trigger was at last_true_cycle
-                if last_true_cycle is not None:
-                    trigger_cycle = last_true_cycle
-                    break
-        
-        # If we never found a false cycle, use the earliest true cycle
-        if trigger_cycle is None and last_true_cycle is not None:
-            trigger_cycle = last_true_cycle
-        if search_floor > 0 and trigger_cycle is None:
-            self.stats["temporal_work_budget_reached"] = True
-        
-        return trigger_cycle
+        self.stats["sva_trigger_evidence"] = "missing_exact"
+        self.stats["sva_exact_trigger_missing"] = True
+        return None
     
     def _prepare_node(self, signal: str, cycle: int, depth: int,
                       parent_hierarchy: str = '') -> Tuple[CausalNode, bool]:
@@ -1109,12 +1016,6 @@ class BackwardSlicer:
             lookup_signal, module_hint
         )
         
-        # If not found, try with original signal name
-        if not rtl_context.get("found", False):
-            rtl_context = self.dependency_provider.get_rtl_context(
-                original_signal, module_hint
-            )
-        
         node = CausalNode(
             id=node_id,
             signal=signal,
@@ -1131,7 +1032,7 @@ class BackwardSlicer:
                 else "hierarchy_inferred"
                 if parent_hierarchy
                 and resolved_signal == f"{parent_hierarchy}.{original_signal}"
-                else "basename_fallback"
+                else "unresolved"
             ),
         )
         

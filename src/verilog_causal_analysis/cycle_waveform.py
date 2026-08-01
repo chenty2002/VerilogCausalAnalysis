@@ -222,9 +222,8 @@ class CycleAlignedWaveform:
     ) -> SignalResolution:
         """Resolve a waveform signal once and cache the identity result.
 
-        Resolution is independent of cycle. Exact names take precedence,
-        followed by normalized hierarchy/suffix indexes. Multiple fallback
-        candidates remain explicit so production callers can fail closed.
+        Resolution is independent of cycle. Only exact names and a unique
+        normalized hierarchy match are accepted.
         """
         cache_key = (signal_name, hierarchy, prefer_hierarchy)
         cached = self._resolution_cache.get(cache_key)
@@ -270,15 +269,8 @@ class CycleAlignedWaveform:
             else normalized_signal
         )
         indexed_candidates: List[str] = []
-        for key in dict.fromkeys(
-            (
-                normalized_qualified,
-                normalized_signal,
-                normalized_signal.rsplit(".", 1)[-1],
-            )
-        ):
+        for key in dict.fromkeys((normalized_qualified, normalized_signal)):
             indexed_candidates.extend(self._normalized_names.get(key, ()))
-            indexed_candidates.extend(self._suffix_names.get(key, ()))
 
         candidates = tuple(sorted(set(indexed_candidates)))
         if candidates:
@@ -289,20 +281,20 @@ class CycleAlignedWaveform:
             )
             if preferred:
                 candidates = preferred
-            strength = (
-                "hierarchy_inferred"
-                if len(candidates) == 1
+            exact_normalized = (
+                len(candidates) == 1
                 and self._normalize_signal_name(candidates[0])
                 == normalized_qualified
-                else "basename_fallback"
             )
             result = SignalResolution(
                 requested_signal=signal_name,
                 hierarchy=hierarchy,
-                resolved_signal=candidates[0] if len(candidates) == 1 else None,
+                resolved_signal=candidates[0] if exact_normalized else None,
                 candidates=candidates,
-                identity_strength=strength,
-                ambiguous=len(candidates) > 1,
+                identity_strength=(
+                    "hierarchy_inferred" if exact_normalized else "unresolved"
+                ),
+                ambiguous=not exact_normalized,
             )
         else:
             result = SignalResolution(

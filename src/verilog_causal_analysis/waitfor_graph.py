@@ -17,7 +17,7 @@ from .identity import canonical_sha256, sha256_file, stable_id
 
 
 WAITFOR_FEATURE = "waitfor"
-PROTOCOL_ADAPTER_SCHEMA = "reviewed_protocol_adapter.v1"
+PROTOCOL_ADAPTER_SCHEMA = "reviewed_protocol_adapter"
 _PROTOCOL_EVENTS = {
     "Probe",
     "ProbeAck",
@@ -481,7 +481,7 @@ def build_c5_waitfor_layer(
                 "external": True,
                 "reason": reason,
                 "evidence_strength": "unresolved",
-                "inference_rule": "unresolved_external_completion.v1",
+                "inference_rule": "unresolved_external_completion",
             },
         )
         return external_id
@@ -548,7 +548,7 @@ def build_c5_waitfor_layer(
                 *[str(item) for item in row.get("evidence_refs", [])],
             ],
             evidence_strength="interval_rule_derived",
-            inference_rule="active_state_waits_for_completion.v1",
+            inference_rule="active_state_waits_for_completion",
         )
 
     stalls = [
@@ -579,7 +579,7 @@ def build_c5_waitfor_layer(
                 evidence_strength=str(
                     row.get("evidence_strength", "transition_supported")
                 ),
-                inference_rule="pipeline_admission_waits_for_blocker.v1",
+                inference_rule="pipeline_admission_waits_for_blocker",
             )
             external = add_external(
                 "pipeline_blocker_release",
@@ -602,7 +602,7 @@ def build_c5_waitfor_layer(
                     ],
                 ],
                 evidence_strength="exact_structural",
-                inference_rule="pipeline_blocker_waits_for_release.v1",
+                inference_rule="pipeline_blocker_waits_for_release",
             )
             blocker_release_waiters.add(blocker_id)
         else:
@@ -621,7 +621,7 @@ def build_c5_waitfor_layer(
                 evidence_strength=str(
                     row.get("evidence_strength", "transition_supported")
                 ),
-                inference_rule="valid_ready_stall_waits_for_ready.v1",
+                inference_rule="valid_ready_stall_waits_for_ready",
             )
 
     # C4 certifies a small deterministic subset of blockers whose exact
@@ -637,7 +637,7 @@ def build_c5_waitfor_layer(
         ),
     ):
         seed = root.get("seed") or {}
-        if seed.get("derivation_rule") != "persistent_pipeline_blocker.v1":
+        if seed.get("derivation_rule") != "persistent_pipeline_blocker":
             continue
         blocker_id = str(root["semantic_id"])
         blocker = blockers.get(blocker_id)
@@ -685,7 +685,7 @@ def build_c5_waitfor_layer(
             ],
             evidence_strength="exact_rtl_waveform",
             inference_rule=(
-                "persistent_pipeline_blocker_waits_for_release.v1"
+                "persistent_pipeline_blocker_waits_for_release"
             ),
         )
         blocker_release_waiters.add(blocker_id)
@@ -720,9 +720,9 @@ def build_c5_waitfor_layer(
                 row.get("evidence_strength", "transition_supported")
             ),
             inference_rule=(
-                "arbiter_request_waits_for_grant.v1"
+                "arbiter_request_waits_for_grant"
                 if row_type == "arbiter_wait"
-                else "allocation_waits_for_free_slot.v1"
+                else "allocation_waits_for_free_slot"
             ),
         )
 
@@ -757,7 +757,7 @@ def build_c5_waitfor_layer(
                 "adapter_id": adapter["adapter_id"],
                 "evidence_refs": adapter["review"]["evidence_refs"],
                 "evidence_strength": "exact_structural",
-                "inference_rule": "reviewed_tilelink.channel_label.v1",
+                "inference_rule": "reviewed_tilelink.channel_label",
             }
             graph_edges.append(
                 {
@@ -925,7 +925,7 @@ def build_c5_waitfor_layer(
                 "external_dependencies": external_dependencies,
                 "classification": classification,
                 "formal_verdict": "not_established",
-                "inference_rule": "bounded_failure_window_waitfor.v1",
+                "inference_rule": "bounded_failure_window_waitfor",
             }
         )
         for edge in component_edges:
@@ -978,7 +978,7 @@ def build_c5_waitfor_layer(
                     "classification": "deadlock_candidate",
                     "formal_verdict": "not_established",
                     "component_id": component_id,
-                    "inference_rule": "tarjan_failure_window_scc.v1",
+                    "inference_rule": "tarjan_failure_window_scc",
                 }
             )
 
@@ -1111,7 +1111,7 @@ def get_waitfor_component(
     member_ids = set(component["members"])
     edge_ids = set(component["edges"])
     result = {
-        "schema_version": "chisel_waitfor_component_query.v1",
+        "schema_version": "chisel_waitfor_component_query",
         "graph_id": graph["graph_id"],
         "component": dict(component),
         "members": [
