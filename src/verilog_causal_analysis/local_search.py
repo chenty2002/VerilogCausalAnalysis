@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import math
 import re
+import heapq
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 from .identity import canonical_sha256
 
@@ -350,6 +351,254 @@ class ScoreFeatures:
                 name: self.availability[name] for name in sorted(self.availability)
             },
         }
+
+
+@dataclass(frozen=True)
+class ScoreResult:
+    """Availability-aware local score used only for search scheduling."""
+
+    local_score: float
+    positive_score: float
+    penalty_score: float
+    missing_positive_features: Tuple[str, ...]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "local_score": self.local_score,
+            "positive_score": self.positive_score,
+            "penalty_score": self.penalty_score,
+            "missing_positive_features": list(self.missing_positive_features),
+        }
+
+
+def score_features(policy: SearchPolicy | str, features: ScoreFeatures) -> ScoreResult:
+    """Compute the frozen v1 local score without treating missing data as zero."""
+
+    if isinstance(policy, str):
+        try:
+            policy = POLICY_REGISTRY[policy]
+        except KeyError as error:
+            raise LocalSearchContractError(f"unknown search policy {policy!r}") from error
+    positive_weights = policy.payload["positive_feature_weights"]
+    weighted_sum = 0.0
+    weight_sum = 0.0
+    missing = []
+    for name in POSITIVE_FEATURES:
+        weight = positive_weights[name]
+        if weight is None:
+            continue
+        if features.availability[name] != "available":
+            missing.append(name)
+            continue
+        weighted_sum += float(weight) * float(features.values[name])
+        weight_sum += float(weight)
+    positive = weighted_sum / weight_sum if weight_sum else 0.0
+    penalties = sum(
+        float(policy.payload["penalty_weights"][name])
+        * float(features.values[name])
+        for name in PENALTY_FEATURES
+        if features.availability[name] == "available"
+    )
+    digits = int(policy.payload["score_round_digits"])
+    return ScoreResult(
+        local_score=round(min(1.0, max(0.0, positive - penalties)), digits),
+        positive_score=round(positive, digits),
+        penalty_score=round(penalties, digits),
+        missing_positive_features=tuple(sorted(missing)),
+    )
+
+
+def fanout_penalty(fanout: int) -> float:
+    if isinstance(fanout, bool) or not isinstance(fanout, int) or fanout < 0:
+        raise LocalSearchContractError("fanout must be a non-negative integer")
+    return round(
+        min(1.0, max(0.0, math.log2(max(fanout, 1)) - 1.0) / 4.0),
+        6,
+    )
+
+
+def path_support(edge_scores: Sequence[float], policy: SearchPolicy | str) -> float:
+    """Combine path evidence without the depth decay of score multiplication."""
+
+    if isinstance(policy, str):
+        policy = POLICY_REGISTRY[policy]
+    if not edge_scores:
+        return 1.0
+    scores = tuple(_finite_unit(value, "path edge score") for value in edge_scores)
+    epsilon = float(policy.payload["path_epsilon"])
+    geometric = math.exp(sum(math.log(max(value, epsilon)) for value in scores) / len(scores))
+    mix = policy.payload["path_mix"]
+    result = float(mix["geometric_mean"]) * geometric + float(mix["weakest_edge"]) * min(scores)
+    return round(result, int(policy.payload["score_round_digits"]))
+
+
+def frontier_priority(
+    local_score: float,
+    path_score: float,
+    seed_prior: float,
+    policy: SearchPolicy | str,
+) -> float:
+    if isinstance(policy, str):
+        policy = POLICY_REGISTRY[policy]
+    local = _finite_unit(local_score, "local_score")
+    path = _finite_unit(path_score, "path_score")
+    seed = _finite_unit(seed_prior, "seed_prior")
+    mix = policy.payload["frontier_mix"]
+    result = float(mix["local"]) * local + float(mix["path"]) * path + float(mix["seed"]) * seed
+    return round(result, int(policy.payload["score_round_digits"]))
+
+
+@dataclass(frozen=True)
+class FrontierItem:
+    node_id: str
+    incoming_edge_id: str
+    depth: int
+    seed_id: str
+    seed_rank: int
+    seed_prior: float
+    local_score: float
+    path_score: float
+    frontier_priority: float
+    support_scores: Tuple[float, ...] = ()
+    source_group: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.node_id or not self.seed_id:
+            raise LocalSearchContractError("frontier node_id and seed_id must be non-empty")
+        _non_negative_int(self.depth, "frontier.depth")
+        _non_negative_int(self.seed_rank, "frontier.seed_rank")
+        for name in ("seed_prior", "local_score", "path_score", "frontier_priority"):
+            _finite_unit(getattr(self, name), f"frontier.{name}")
+        for value in self.support_scores:
+            _finite_unit(value, "frontier.support_scores")
+
+    @property
+    def group_id(self) -> str:
+        return self.source_group or self.seed_id
+
+
+@dataclass(frozen=True)
+class FrontierSelection:
+    item: FrontierItem
+    lane: str
+
+
+class FrontierScheduler:
+    """Deterministic LIFO or hybrid exploit/explore frontier."""
+
+    def __init__(self, policy: SearchPolicy | str):
+        if isinstance(policy, str):
+            try:
+                policy = POLICY_REGISTRY[policy]
+            except KeyError as error:
+                raise LocalSearchContractError(f"unknown search policy {policy!r}") from error
+        self.policy = policy
+        self._best: Dict[str, FrontierItem] = {}
+        self._generation: Dict[str, int] = {}
+        self._expanded: set[str] = set()
+        self._exploit: list[tuple[Any, ...]] = []
+        self._explore: list[tuple[Any, ...]] = []
+        self._stack: list[tuple[str, int]] = []
+        self._group_expansions: Dict[str, int] = {}
+        self.expansion_count = 0
+
+    def __len__(self) -> int:
+        return sum(node_id not in self._expanded for node_id in self._best)
+
+    @staticmethod
+    def _better(new: FrontierItem, old: FrontierItem) -> bool:
+        return (
+            -new.frontier_priority,
+            new.depth,
+            new.seed_rank,
+            new.node_id,
+            new.incoming_edge_id,
+        ) < (
+            -old.frontier_priority,
+            old.depth,
+            old.seed_rank,
+            old.node_id,
+            old.incoming_edge_id,
+        )
+
+    def push(self, item: FrontierItem) -> bool:
+        if item.node_id in self._expanded:
+            return False
+        current = self._best.get(item.node_id)
+        if current is not None and not self._better(item, current):
+            return False
+        generation = self._generation.get(item.node_id, 0) + 1
+        self._generation[item.node_id] = generation
+        self._best[item.node_id] = item
+        if self.policy.payload["scheduler_kind"] == "legacy_lifo_dfs":
+            self._stack.append((item.node_id, generation))
+            return True
+        heapq.heappush(
+            self._exploit,
+            (-item.frontier_priority, item.depth, item.seed_rank, item.node_id, item.incoming_edge_id, generation),
+        )
+        heapq.heappush(
+            self._explore,
+            (item.depth, self._group_expansions.get(item.group_id, 0), -item.frontier_priority, item.seed_rank, item.node_id, item.incoming_edge_id, generation),
+        )
+        return True
+
+    def _valid(self, node_id: str, generation: int) -> Optional[FrontierItem]:
+        if node_id in self._expanded or self._generation.get(node_id) != generation:
+            return None
+        return self._best.get(node_id)
+
+    def _pop_stack(self) -> Optional[FrontierItem]:
+        while self._stack:
+            node_id, generation = self._stack.pop()
+            item = self._valid(node_id, generation)
+            if item is not None:
+                return item
+        return None
+
+    def _pop_exploit(self) -> Optional[FrontierItem]:
+        while self._exploit:
+            *_key, node_id, _edge_id, generation = heapq.heappop(self._exploit)
+            item = self._valid(node_id, generation)
+            if item is not None:
+                return item
+        return None
+
+    def _pop_explore(self) -> Optional[FrontierItem]:
+        while self._explore:
+            depth, group_count, _priority, seed_rank, node_id, edge_id, generation = heapq.heappop(self._explore)
+            item = self._valid(node_id, generation)
+            if item is None:
+                continue
+            current_count = self._group_expansions.get(item.group_id, 0)
+            if group_count != current_count:
+                heapq.heappush(
+                    self._explore,
+                    (depth, current_count, -item.frontier_priority, seed_rank, node_id, edge_id, generation),
+                )
+                continue
+            return item
+        return None
+
+    def pop(self) -> Optional[FrontierSelection]:
+        if self.policy.payload["scheduler_kind"] == "legacy_lifo_dfs":
+            item = self._pop_stack()
+            lane = "legacy"
+        else:
+            period = int(self.policy.payload["exploration_period"])
+            explore = (self.expansion_count + 1) % period == 0
+            if explore:
+                item = self._pop_explore() or self._pop_exploit()
+                lane = "explore" if item is not None else "exploit"
+            else:
+                item = self._pop_exploit() or self._pop_explore()
+                lane = "exploit" if item is not None else "explore"
+        if item is None:
+            return None
+        self._expanded.add(item.node_id)
+        self._group_expansions[item.group_id] = self._group_expansions.get(item.group_id, 0) + 1
+        self.expansion_count += 1
+        return FrontierSelection(item, lane)
 
 
 def validate_search_summary(

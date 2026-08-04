@@ -13,6 +13,26 @@ from enum import Enum
 
 from .verilog_parser import VerilogParser, Dependency, DependencyType
 from .cycle_waveform import CycleAlignedWaveform, parse_binary_value, invert_value, values_differ
+from .contribution import (
+    ContributionEvidence,
+    LegacyContributionEvidence,
+    adapt_legacy_contribution,
+    evaluate_interventions,
+    generate_interventions,
+    route_contribution,
+    structural_evidence,
+    toggle_evidence,
+)
+from .local_search import (
+    FrontierItem,
+    FrontierScheduler,
+    POLICY_REGISTRY,
+    ScoreFeatures,
+    SearchPolicy,
+    frontier_priority,
+    path_support,
+    score_features,
+)
 
 
 class ContributionType(Enum):
@@ -69,9 +89,10 @@ class CausalEdge:
     contribution_score: float
     evidence: Dict[str, Any] = field(default_factory=dict)
     change_examples: List[Dict] = field(default_factory=list)
+    contribution_evidence: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        row = {
             "src_node_id": self.src_node_id,
             "dst_node_id": self.dst_node_id,
             "reason": self.reason,
@@ -80,6 +101,9 @@ class CausalEdge:
             "evidence": self.evidence,
             "change_examples": self.change_examples
         }
+        if self.contribution_evidence is not None:
+            row["contribution_evidence"] = self.contribution_evidence
+        return row
 
 
 # Operator precedence table (higher = binds tighter)
@@ -623,6 +647,22 @@ class _StatementEvaluationContext:
     original_result: Optional[str]
 
 
+@dataclass
+class CandidateExpansion:
+    dep: Dependency
+    parent_cycle: int
+    parent_node: CausalNode
+    parent_is_new: bool
+    is_causal: bool
+    weak_candidate: bool
+    contribution_score: float
+    contribution_evidence: ContributionEvidence | LegacyContributionEvidence
+    change_examples: List[Dict[str, Any]]
+    local_score: float
+    score_features: Optional[ScoreFeatures]
+    edge: Optional[CausalEdge] = None
+
+
 class BackwardSlicer:
     """Backward slicing engine for building causal DAG.
     
@@ -638,6 +678,9 @@ class BackwardSlicer:
                  *,
                  exact_sva_trigger_cycle: Optional[int] = None,
                  dependency_provider: Optional[Any] = None,
+                 search_policy: Optional[SearchPolicy | str] = None,
+                 contribution_evaluator: Optional[Any] = None,
+                 max_intervention_evaluations: Optional[int] = None,
                  ):
         """Initialize backward slicer with RTL parser and waveform data."""
         self.parser = verilog_parser
@@ -654,6 +697,20 @@ class BackwardSlicer:
         self.temporal_lookback_budget = max(64, max_nodes * 8)
         self.temporal_value_budget = max(256, max_nodes * 32)
         self.exact_sva_trigger_cycle = exact_sva_trigger_cycle
+        if isinstance(search_policy, str):
+            try:
+                search_policy = POLICY_REGISTRY[search_policy]
+            except KeyError as error:
+                raise ValueError(f"unknown search policy {search_policy!r}") from error
+        self.search_policy = search_policy
+        self.contribution_evaluator = contribution_evaluator
+        self.max_intervention_evaluations = (
+            max_nodes * 32
+            if max_intervention_evaluations is None
+            else max_intervention_evaluations
+        )
+        if self.max_intervention_evaluations < 0:
+            raise ValueError("max_intervention_evaluations must be non-negative")
         self.dep_graph = verilog_parser.build_dependency_graph()
         self._signal_sources_cache: Dict[str, List[str]] = {}
         self._statement_evaluation_cache: Dict[
@@ -686,6 +743,12 @@ class BackwardSlicer:
             "candidate_evaluations": 0,
             "candidate_evaluation_budget": self.candidate_evaluation_budget,
             "candidate_evaluation_budget_reached": False,
+            "intervention_evaluations": 0,
+            "intervention_evaluation_budget": self.max_intervention_evaluations,
+            "intervention_evaluation_budget_reached": False,
+            "expanded_nodes": 0,
+            "exploit_expansions": 0,
+            "explore_expansions": 0,
             "statement_evaluations": 0,
             "statement_environment_builds": 0,
             "compiled_expression_hits": 0,
@@ -1455,199 +1518,389 @@ class BackwardSlicer:
         ):
             return None
         return parent_cycle
-    
-    def _slice_node(self, node: CausalNode, depth: int):
-        """
-        Perform backward slicing from a node.
-        
-        Args:
-            node: Current node to slice from
-            depth: Current depth
-        """
-        if node.id in self.visited:
-            return
-        
-        self.visited.add(node.id)
-        
-        # Extract base signal name and hierarchy for lookup
+
+    def _prepare_direct_candidates(
+        self, node: CausalNode, depth: int
+    ) -> Tuple[str, List[Tuple[Dependency, int]], Dict[StatementEvaluationKey, Tuple[Dependency, ...]]]:
+        """Resolve and group direct dependencies without committing graph state."""
         base_signal = self._extract_base_signal_name(node.signal)
         parent_hierarchy = self._extract_module_hierarchy(node.signal)
         module_hint = self._infer_module_name(node.signal, parent_hierarchy)
-        
-        # Get dependencies from RTL
-        lookup_signal = (
-            node.signal if self.instance_local_dependencies else base_signal
-        )
-        deps = self.dependency_provider.get_dependencies_for_signal(
-            lookup_signal, module_hint
-        )
-        
+        lookup_signal = node.signal if self.instance_local_dependencies else base_signal
+        deps = self.dependency_provider.get_dependencies_for_signal(lookup_signal, module_hint)
         if not deps:
-            # Check if we can find with the full name (no width annotation)
             clean_signal = re.sub(r'\s*\[\d+:\d+\]$', '', node.signal)
-            deps = self.dependency_provider.get_dependencies_for_signal(
-                clean_signal, module_hint
-            )
-        
-        if not deps:
-            # No RTL dependencies found, mark as potential root
-            node.is_root = True
-            return
-
+            deps = self.dependency_provider.get_dependencies_for_signal(clean_signal, module_hint)
         candidates = [
             (dep, parent_cycle)
             for dep in deps
-            for parent_cycle in [
-                self._expandable_parent_cycle(node, dep, parent_hierarchy)
-            ]
+            for parent_cycle in [self._expandable_parent_cycle(node, dep, parent_hierarchy)]
             if parent_cycle is not None
         ]
-        if not candidates:
-            node.is_root = True
-            return
-        if depth >= self.max_depth:
-            # max_depth is the maximum number of edge hops from the endpoint:
-            # the current node may exist at the limit, but no parent may be
-            # materialized beyond it.
-            self.stats["max_depth_reached"] = True
-            return
-
-        statement_groups: Dict[
-            StatementEvaluationKey, Tuple[Dependency, ...]
-        ] = {}
-        grouped_rows: Dict[StatementEvaluationKey, List[Dependency]] = {}
-        for candidate_dep, _parent_cycle in candidates:
-            key = self._statement_key(
-                candidate_dep, node.signal, node.cycle
+        if self.search_policy is not None and self.search_policy.policy_id != "legacy_dfs_v1":
+            candidates.sort(
+                key=lambda row: (
+                    row[0].source,
+                    row[1],
+                    row[0].dep_type.value,
+                    row[0].file_path,
+                    row[0].line_start,
+                    row[0].line_end,
+                    row[0].expression,
+                )
             )
-            grouped_rows.setdefault(key, []).append(candidate_dep)
-        for key, rows in grouped_rows.items():
-            statement_groups[key] = tuple(rows)
+        grouped: Dict[StatementEvaluationKey, List[Dependency]] = {}
+        for dep, _cycle in candidates:
+            grouped.setdefault(self._statement_key(dep, node.signal, node.cycle), []).append(dep)
+        return parent_hierarchy, candidates, {
+            key: tuple(rows) for key, rows in grouped.items()
+        }
 
-        parents_to_recurse: List[Tuple[CausalNode, int]] = []
-        weak_edges_for_target = 0
+    @staticmethod
+    def _legacy_method(examples: List[Dict[str, Any]], is_causal: bool) -> str:
+        if examples:
+            return str(examples[0].get("type", "counterfactual"))
+        return "not_supported" if not is_causal else "counterfactual"
 
-        for dep, parent_cycle in candidates:
-            if (
-                self.stats["candidate_evaluations"]
-                >= self.candidate_evaluation_budget
-            ):
-                self.stats["candidate_evaluation_budget_reached"] = True
-                break
-
-            # Resolve identity/value/context without committing the candidate.
-            parent_node, parent_is_new = self._prepare_node(
-                dep.source, parent_cycle, depth + 1, parent_hierarchy
+    def _evaluate_typed_contribution(
+        self,
+        node: CausalNode,
+        parent_node: CausalNode,
+        dep: Dependency,
+        statement_dependencies: Tuple[Dependency, ...],
+    ) -> ContributionEvidence:
+        remaining = max(
+            0,
+            self.max_intervention_evaluations
+            - self.stats["intervention_evaluations"],
+        )
+        if self.contribution_evaluator is not None:
+            evidence = self.contribution_evaluator(
+                target_node=node,
+                parent_node=parent_node,
+                dependency=dep,
+                statement_dependencies=statement_dependencies,
+                remaining_interventions=remaining,
             )
-            
-            # Final self-loop check using node IDs
-            if parent_node.id == node.id:
-                self.stats["rejected_candidates"] += 1
-                continue
-            
-            # Check for duplicate edges
-            edge_key = (parent_node.id, node.id)
-            if edge_key in self._edge_set:
-                continue  # Skip duplicate edge
-            
-            # Evaluate causality using full signal names from nodes
-            self.stats["candidate_evaluations"] += 1
+            if not isinstance(evidence, ContributionEvidence):
+                raise TypeError("contribution_evaluator must return ContributionEvidence")
+            if evidence.interventions.evaluated > remaining:
+                raise ValueError("contribution_evaluator exceeded the intervention budget")
+            self.stats["intervention_evaluations"] += evidence.interventions.evaluated
+            return evidence
+
+        if not dep.expression.strip():
+            causal, _score, _examples = self._simple_toggle_test(
+                parent_node.signal, parent_node.cycle, node.signal, node.cycle
+            )
+            return toggle_evidence(source_toggled=causal, target_toggled=causal) if causal else structural_evidence()
+
+        context = self._get_statement_evaluation(
+            node.signal, node.cycle, dep, statement_dependencies
+        )
+        source_value = parent_node.value
+        planned = generate_interventions(
+            source_value,
+            max_interventions=int(self.search_policy.payload["max_interventions_per_candidate"]),
+        )
+        evaluated_values = planned[:remaining]
+        perturb_key = dep.source if dep.source in context.environment else self._extract_base_signal_name(parent_node.signal)
+        results: List[Optional[str]] = []
+        for value in evaluated_values:
+            environment = dict(context.environment)
+            environment[perturb_key] = value
+            results.append(context.compiled.evaluate(environment))
+        self.stats["intervention_evaluations"] += len(evaluated_values)
+        truncated = len(evaluated_values) < len(planned)
+        if truncated:
+            self.stats["intervention_evaluation_budget_reached"] = True
+        results.extend([None] * (len(planned) - len(results)))
+        rule_active: Optional[bool] = True
+        method = "expression_intervention"
+        if dep.condition:
+            condition_result = self._get_compiled_expression(dep.condition).evaluate(context.environment)
+            rule_active = None if condition_result is None else ExpressionEvaluator(context.environment)._is_true(condition_result)
+            method = "active_rule_intervention"
+        return evaluate_interventions(
+            source_value=source_value,
+            original_result=context.original_result,
+            observed_target=node.value,
+            intervention_values=planned,
+            intervention_results=results,
+            target_basis="full_exact_target",
+            method=method,
+            global_budget_truncated=truncated,
+            rule_active=rule_active,
+        )
+
+    def _extract_score_features(
+        self,
+        parent_node: CausalNode,
+        dep: Dependency,
+        evidence: ContributionEvidence | LegacyContributionEvidence,
+    ) -> ScoreFeatures:
+        values: Dict[str, Optional[float]] = {
+            name: None
+            for name in ("C_cf", "C_obs", "C_time", "C_ctrl", "C_sem", "C_structural", "P_unknown", "P_ambiguity", "P_temp", "P_fanout")
+        }
+        availability = {name: "not_available" for name in values}
+
+        if isinstance(evidence, LegacyContributionEvidence):
+            values["C_cf"] = evidence.legacy_score
+            availability["C_cf"] = "available"
+        else:
+            routed = route_contribution(evidence)
+            values[routed.feature_name] = routed.value
+            availability[routed.feature_name] = routed.availability
+
+        values["C_obs"] = {
+            "exact": 1.0,
+            "hierarchy_inferred": 0.6,
+        }.get(parent_node.identity_strength, 0.0)
+        availability["C_obs"] = "available"
+        if availability["C_time"] != "available":
+            values["C_time"] = 0.8 if dep.dep_type == DependencyType.SEQUENTIAL else 0.4
+            availability["C_time"] = "available"
+        if availability["C_ctrl"] != "available":
+            values["C_ctrl"] = 0.85 if dep.dep_type == DependencyType.SEQUENTIAL else 0.7 if dep.condition else 0.3
+            availability["C_ctrl"] = "available"
+        if self.search_policy.policy_id == "chisel_hybrid_best_first_v1":
+            values["C_sem"] = 0.0
+            availability["C_sem"] = "available"
+        else:
+            availability["C_sem"] = "not_applicable"
+        if availability["C_structural"] == "not_available":
+            availability["C_structural"] = "not_applicable"
+
+        unknown = any(char in parent_node.value.lower() for char in ("x", "z"))
+        penalty_values = {
+            "P_unknown": 1.0 if unknown else 0.0,
+            "P_ambiguity": 0.0 if parent_node.identity_strength == "exact" else 0.5 if parent_node.identity_strength == "hierarchy_inferred" else 1.0,
+            "P_temp": 0.0,
+            "P_fanout": 0.0,
+        }
+        for name, value in penalty_values.items():
+            values[name] = value
+            availability[name] = "available"
+        return ScoreFeatures.from_dict(
+            {"feature_vector": values, "feature_availability": availability}
+        )
+
+    def _evaluate_candidate(
+        self,
+        node: CausalNode,
+        depth: int,
+        parent_hierarchy: str,
+        dep: Dependency,
+        parent_cycle: int,
+        statement_dependencies: Tuple[Dependency, ...],
+    ) -> Optional[CandidateExpansion]:
+        parent_node, parent_is_new = self._prepare_node(
+            dep.source, parent_cycle, depth + 1, parent_hierarchy
+        )
+        if parent_node.id == node.id or (parent_node.id, node.id) in self._edge_set:
+            self.stats["rejected_candidates"] += 1
+            return None
+        self.stats["candidate_evaluations"] += 1
+
+        if self.search_policy is None or self.search_policy.policy_id in {
+            "legacy_dfs_v1", "legacy_scalar_best_first_v1"
+        }:
             is_causal, score, examples = self._evaluate_counterfactual(
-                node.signal, node.cycle,
-                parent_node.signal, parent_cycle,
-                dep,
-                statement_groups[
-                    self._statement_key(dep, node.signal, node.cycle)
-                ],
+                node.signal, node.cycle, parent_node.signal, parent_cycle, dep, statement_dependencies
             )
-            
-            # For SVA assertions at trigger cycle, if antecedent is true,
-            # all signals in antecedent are causally contributing
             if not is_causal and '|->' in dep.expression:
-                # Check if this is an SVA trigger cycle (antecedent is true)
                 trigger_cycle = self.stats.get("sva_trigger_cycle")
                 if trigger_cycle is not None and node.cycle == trigger_cycle:
-                    # At trigger cycle, all antecedent signals contribute to assertion
-                    is_causal = True
-                    score = 0.85  # High score for antecedent signals
+                    is_causal, score = True, 0.85
                     examples = [{
-                        "type": "sva_antecedent",
-                        "trigger_cycle": trigger_cycle,
-                        "expression": dep.expression,
-                        "signal": parent_node.signal,
-                        "value": parent_node.value
+                        "type": "sva_antecedent", "trigger_cycle": trigger_cycle,
+                        "expression": dep.expression, "signal": parent_node.signal,
+                        "value": parent_node.value,
                     }]
-            
-            weak_candidate = not is_causal
-            if weak_candidate and not node.rtl_context_missing:
-                # Counterfactual did not show causality, but we may still want to track
-                # this dependency based on RTL structure for deeper exploration
+            weak = not is_causal
+            if weak and not node.rtl_context_missing:
                 score = 0.3
-                examples = [{
-                    "type": "structural",
-                    "reason": "RTL dependency exists but counterfactual not conclusive"
-                }]
+                examples = [{"type": "structural", "reason": "RTL dependency exists but counterfactual not conclusive"}]
+            envelope = adapt_legacy_contribution(
+                legacy_method=self._legacy_method(examples, is_causal),
+                legacy_score=score,
+                expression_evaluations=1,
+                intervention_evaluations=1 if any(row.get("type") == "counterfactual" for row in examples) else 0,
+                change_examples=examples,
+            )
+            if self.search_policy is not None and self.search_policy.policy_id == "legacy_scalar_best_first_v1":
+                feature_row = self._extract_score_features(parent_node, dep, envelope)
+                local_score = score_features(self.search_policy, feature_row).local_score
+            else:
+                feature_row = None
+                local_score = score
+        else:
+            raw_evidence = self._evaluate_typed_contribution(
+                node, parent_node, dep, statement_dependencies
+            )
+            is_causal = raw_evidence.status == "supported"
+            weak = not is_causal
+            envelope = raw_evidence if is_causal else structural_evidence()
+            score = envelope.score
+            examples = []
+            feature_row = self._extract_score_features(parent_node, dep, envelope)
+            local_score = score_features(self.search_policy, feature_row).local_score
+        return CandidateExpansion(
+            dep, parent_cycle, parent_node, parent_is_new, is_causal, weak,
+            score, envelope, examples, local_score, feature_row,
+        )
 
-            if weak_candidate and (
+    def _admit_evaluated_candidates(
+        self, node: CausalNode, evaluated: List[CandidateExpansion]
+    ) -> List[CandidateExpansion]:
+        if self.search_policy is not None and self.search_policy.policy_id != "legacy_dfs_v1":
+            evaluated.sort(
+                key=lambda row: (
+                    row.weak_candidate,
+                    -row.local_score,
+                    row.parent_node.id,
+                    row.dep.source,
+                )
+            )
+        admitted: List[CandidateExpansion] = []
+        weak_for_target = 0
+        for candidate in evaluated:
+            if (candidate.parent_node.id, node.id) in self._edge_set:
+                continue
+            if candidate.weak_candidate and (
                 self.stats["weak_edges_admitted"] >= self.weak_edge_budget
-                or weak_edges_for_target >= self.weak_beam_width
+                or weak_for_target >= self.weak_beam_width
             ):
                 self.stats["rejected_candidates"] += 1
                 continue
-            
-            # Determine contribution type
+            dep = candidate.dep
             if dep.dep_type == DependencyType.SEQUENTIAL:
-                contrib_type = ContributionType.STATE
+                contribution_type = ContributionType.STATE
             elif dep.condition:
-                contrib_type = ContributionType.CONDITIONAL
-            elif examples and examples[0].get("type") == "toggle_correlation":
-                contrib_type = ContributionType.TOGGLE
+                contribution_type = ContributionType.CONDITIONAL
+            elif candidate.contribution_evidence.to_dict().get("method") == "toggle_correlation" or (
+                candidate.change_examples and candidate.change_examples[0].get("type") == "toggle_correlation"
+            ):
+                contribution_type = ContributionType.TOGGLE
             else:
-                contrib_type = ContributionType.EXPR_EVAL
-            
-            # Create edge
+                contribution_type = ContributionType.EXPR_EVAL
             edge = CausalEdge(
-                src_node_id=parent_node.id,
+                src_node_id=candidate.parent_node.id,
                 dst_node_id=node.id,
                 reason=f"{dep.source} affects {node.signal} via {dep.dep_type.value}",
-                contribution_type=contrib_type,
-                contribution_score=score,
+                contribution_type=contribution_type,
+                contribution_score=candidate.contribution_score,
                 evidence={
                     "file": dep.file_path,
                     "lines": [dep.line_start, dep.line_end],
                     "code_snippet": dep.code_snippet,
                     "expression": dep.expression,
-                    "condition": dep.condition
+                    "condition": dep.condition,
                 },
-                change_examples=examples
+                change_examples=candidate.change_examples,
+                contribution_evidence=(
+                    candidate.contribution_evidence.to_dict()
+                    if self.search_policy is not None
+                    else None
+                ),
             )
-            
-            committed_parent = self._commit_candidate(
-                parent_node, parent_is_new, edge
-            )
-            if committed_parent is None:
+            committed = self._commit_candidate(candidate.parent_node, candidate.parent_is_new, edge)
+            if committed is None:
                 continue
-            parent_node = committed_parent
-            if weak_candidate:
-                weak_edges_for_target += 1
+            candidate.parent_node = committed
+            candidate.edge = edge
+            if candidate.weak_candidate:
+                weak_for_target += 1
                 self.stats["weak_edges_admitted"] += 1
-            
-            # Update parent node suspect score
-            parent_node.suspect_score = max(parent_node.suspect_score, score * 0.9)
+            committed.suspect_score = max(committed.suspect_score, candidate.contribution_score * 0.9)
+            admitted.append(candidate)
+        return admitted
 
-            # An unknown value is an explicit waveform frontier. Continuing
-            # raw counterfactual recursion beyond it cannot recover dynamic
-            # causality and instead expands a large weak structural cone.
-            # Static/reversible membership remains available in the semantic
-            # layer, while the frontier node and its exact RTL edge stay in
-            # this graph.
-            if any(char in parent_node.value.lower() for char in ("x", "z")):
+    def _expand_node(self, node: CausalNode, depth: int) -> List[CandidateExpansion]:
+        if node.id in self.visited:
+            return []
+        self.visited.add(node.id)
+        self.stats["expanded_nodes"] += 1
+        parent_hierarchy, candidates, statement_groups = self._prepare_direct_candidates(node, depth)
+        if not candidates:
+            node.is_root = True
+            return []
+        if depth >= self.max_depth:
+            self.stats["max_depth_reached"] = True
+            return []
+        evaluated: List[CandidateExpansion] = []
+        for dep, parent_cycle in candidates:
+            if self.stats["candidate_evaluations"] >= self.candidate_evaluation_budget:
+                self.stats["candidate_evaluation_budget_reached"] = True
+                break
+            result = self._evaluate_candidate(
+                node, depth, parent_hierarchy, dep, parent_cycle,
+                statement_groups[self._statement_key(dep, node.signal, node.cycle)],
+            )
+            if result is not None:
+                evaluated.append(result)
+        return self._admit_evaluated_candidates(node, evaluated)
+
+    def _slice_node(self, node: CausalNode, depth: int):
+        """Legacy recursive traversal over the shared expansion implementation."""
+        for candidate in self._expand_node(node, depth):
+            if not any(char in candidate.parent_node.value.lower() for char in ("x", "z")):
+                self._slice_node(candidate.parent_node, depth + 1)
+
+    def _run_frontier(self, endpoint_node: CausalNode) -> None:
+        scheduler = FrontierScheduler(self.search_policy)
+        scheduler.push(
+            FrontierItem(
+                node_id=endpoint_node.id,
+                incoming_edge_id="seed",
+                depth=0,
+                seed_id="endpoint",
+                seed_rank=0,
+                seed_prior=1.0,
+                local_score=1.0,
+                path_score=1.0,
+                frontier_priority=1.0,
+                support_scores=(),
+                source_group=self._extract_module_hierarchy(endpoint_node.signal),
+            )
+        )
+        while True:
+            selection = scheduler.pop()
+            if selection is None:
+                break
+            self.stats[f"{selection.lane}_expansions"] += 1
+            node = self.nodes.get(selection.item.node_id)
+            if node is None:
                 continue
-
-            parents_to_recurse.append((parent_node, depth + 1))
-
-        for parent_node, parent_depth in parents_to_recurse:
-            self._slice_node(parent_node, parent_depth)
+            for candidate in self._expand_node(node, selection.item.depth):
+                parent = candidate.parent_node
+                if any(char in parent.value.lower() for char in ("x", "z")):
+                    continue
+                support_scores = selection.item.support_scores + (candidate.local_score,)
+                path_score = path_support(support_scores, self.search_policy)
+                priority = frontier_priority(
+                    candidate.local_score, path_score, selection.item.seed_prior,
+                    self.search_policy,
+                )
+                edge_id = hashlib.md5(
+                    f"{parent.id}->{node.id}".encode()
+                ).hexdigest()[:12]
+                scheduler.push(
+                    FrontierItem(
+                        node_id=parent.id,
+                        incoming_edge_id=edge_id,
+                        depth=selection.item.depth + 1,
+                        seed_id=selection.item.seed_id,
+                        seed_rank=selection.item.seed_rank,
+                        seed_prior=selection.item.seed_prior,
+                        local_score=candidate.local_score,
+                        path_score=path_score,
+                        frontier_priority=priority,
+                        support_scores=support_scores,
+                        source_group=self._extract_module_hierarchy(parent.signal),
+                    )
+                )
     
     def _analyze_sva_time_window(self, 
                                   trigger_cycle: int,
@@ -1877,7 +2130,10 @@ class BackwardSlicer:
                         self._slice_node(trigger_node, trigger_node.depth)
         else:
             # No time window - just do normal backward slicing from endpoint
-            self._slice_node(endpoint_node, 0)
+            if self.search_policy is not None and self.search_policy.policy_id != "legacy_dfs_v1":
+                self._run_frontier(endpoint_node)
+            else:
+                self._slice_node(endpoint_node, 0)
         
         # Mark leaf nodes as roots
         nodes_with_incoming = set(e.dst_node_id for e in self.edges)
