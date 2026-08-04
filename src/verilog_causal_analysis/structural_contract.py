@@ -8,6 +8,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Tuple
 
 from .identity import canonical_sha256, contains_absolute_path, stable_id
+from .local_search import (
+    LocalSearchContractError,
+    SearchPolicyIdentity,
+    validate_search_summary,
+)
 
 
 STRUCTURAL_REQUEST_SCHEMA = "verilog_structural_causal_request"
@@ -124,8 +129,12 @@ class StructuralCausalRequest:
     clock_signal: str
     endpoint_signal: str
     endpoint_cycle: int
+    search_policy: SearchPolicyIdentity
     max_depth: int
     max_nodes: int
+    max_expanded_nodes: int
+    max_candidate_evaluations: int
+    max_intervention_evaluations: int
     random_seed: int
     strict: bool
 
@@ -142,6 +151,7 @@ class StructuralCausalRequest:
                 "rtl_files",
                 "clock",
                 "endpoint",
+                "search_policy",
                 "bounds",
                 "random_seed",
                 "strict",
@@ -174,9 +184,34 @@ class StructuralCausalRequest:
         endpoint_cycle = row["endpoint"]["cycle"]
         if isinstance(endpoint_cycle, bool) or not isinstance(endpoint_cycle, int) or endpoint_cycle < 0:
             raise StructuralContractError("endpoint.cycle must be a non-negative integer")
-        _exact_keys(row["bounds"], {"max_depth", "max_nodes"}, "bounds")
+        try:
+            search_policy = SearchPolicyIdentity.from_dict(row["search_policy"])
+        except LocalSearchContractError as error:
+            raise StructuralContractError(str(error)) from error
+        _exact_keys(
+            row["bounds"],
+            {
+                "max_depth",
+                "max_nodes",
+                "max_expanded_nodes",
+                "max_candidate_evaluations",
+                "max_intervention_evaluations",
+            },
+            "bounds",
+        )
         max_depth = _positive_int(row["bounds"]["max_depth"], "bounds.max_depth")
         max_nodes = _positive_int(row["bounds"]["max_nodes"], "bounds.max_nodes")
+        max_expanded_nodes = _positive_int(
+            row["bounds"]["max_expanded_nodes"], "bounds.max_expanded_nodes"
+        )
+        max_candidate_evaluations = _positive_int(
+            row["bounds"]["max_candidate_evaluations"],
+            "bounds.max_candidate_evaluations",
+        )
+        max_intervention_evaluations = _positive_int(
+            row["bounds"]["max_intervention_evaluations"],
+            "bounds.max_intervention_evaluations",
+        )
         seed = row["random_seed"]
         if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
             raise StructuralContractError("random_seed must be a non-negative integer")
@@ -192,8 +227,12 @@ class StructuralCausalRequest:
             clock_signal,
             endpoint_signal,
             endpoint_cycle,
+            search_policy,
             max_depth,
             max_nodes,
+            max_expanded_nodes,
+            max_candidate_evaluations,
+            max_intervention_evaluations,
             seed,
             strict,
         )
@@ -217,9 +256,13 @@ class StructuralCausalRequest:
                 "signal": self.endpoint_signal,
                 "cycle": self.endpoint_cycle,
             },
+            "search_policy": self.search_policy.to_dict(),
             "bounds": {
                 "max_depth": self.max_depth,
                 "max_nodes": self.max_nodes,
+                "max_expanded_nodes": self.max_expanded_nodes,
+                "max_candidate_evaluations": self.max_candidate_evaluations,
+                "max_intervention_evaluations": self.max_intervention_evaluations,
             },
             "random_seed": self.random_seed,
             "strict": self.strict,
@@ -247,8 +290,12 @@ def make_structural_request(
     clock_signal: str,
     endpoint_signal: str,
     endpoint_cycle: int,
+    search_policy: Mapping[str, Any],
     max_depth: int = 12,
     max_nodes: int = 120,
+    max_expanded_nodes: int = 120,
+    max_candidate_evaluations: int = 960,
+    max_intervention_evaluations: int = 3840,
     random_seed: int = 0,
     strict: bool = True,
 ) -> StructuralCausalRequest:
@@ -260,7 +307,14 @@ def make_structural_request(
         "rtl_files": [dict(item) for item in rtl_files],
         "clock": {"signal": clock_signal, "edge": "rising"},
         "endpoint": {"signal": endpoint_signal, "cycle": endpoint_cycle},
-        "bounds": {"max_depth": max_depth, "max_nodes": max_nodes},
+        "search_policy": dict(search_policy),
+        "bounds": {
+            "max_depth": max_depth,
+            "max_nodes": max_nodes,
+            "max_expanded_nodes": max_expanded_nodes,
+            "max_candidate_evaluations": max_candidate_evaluations,
+            "max_intervention_evaluations": max_intervention_evaluations,
+        },
         "random_seed": random_seed,
         "strict": strict,
     }
@@ -299,6 +353,7 @@ def validate_structural_graph(graph: Mapping[str, Any]) -> Dict[str, Any]:
             "status",
             "identity",
             "bounds",
+            "search_summary",
             "nodes",
             "edges",
             "diagnostics",
@@ -330,6 +385,9 @@ def validate_structural_graph(graph: Mapping[str, Any]) -> Dict[str, Any]:
         {
             "max_depth",
             "max_nodes",
+            "max_expanded_nodes",
+            "max_candidate_evaluations",
+            "max_intervention_evaluations",
             "max_depth_reached",
             "max_nodes_reached",
         },
@@ -337,6 +395,12 @@ def validate_structural_graph(graph: Mapping[str, Any]) -> Dict[str, Any]:
     )
     _positive_int(graph["bounds"]["max_depth"], "graph.bounds.max_depth")
     _positive_int(graph["bounds"]["max_nodes"], "graph.bounds.max_nodes")
+    for key in (
+        "max_expanded_nodes",
+        "max_candidate_evaluations",
+        "max_intervention_evaluations",
+    ):
+        _positive_int(graph["bounds"][key], f"graph.bounds.{key}")
     for key in ("max_depth_reached", "max_nodes_reached"):
         if not isinstance(graph["bounds"][key], bool):
             raise StructuralContractError(f"graph.bounds.{key} must be boolean")
@@ -425,6 +489,10 @@ def validate_structural_graph(graph: Mapping[str, Any]) -> Dict[str, Any]:
         )
     if not isinstance(graph["diagnostics"], list):
         raise StructuralContractError("graph.diagnostics must be a list")
+    try:
+        validate_search_summary(graph["search_summary"])
+    except LocalSearchContractError as error:
+        raise StructuralContractError(str(error)) from error
     if contains_absolute_path(graph):
         raise StructuralContractError("graph must not contain absolute paths")
     return dict(graph)

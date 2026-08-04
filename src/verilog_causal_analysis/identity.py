@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 
-ANALYZER_REVISION = "verilog-causal-analysis-current"
+ANALYZER_REVISION = "verilog-causal-analysis-ls-a-v1"
 HDLCONVERTOR_REVISION = "03c081a307850dc3c438df36592fc67b1ef6cfc0"
 
 

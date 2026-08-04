@@ -8,6 +8,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
 from .identity import canonical_sha256, stable_id
+from .local_search import (
+    LocalSearchContractError,
+    SearchPolicyIdentity,
+    validate_search_summary,
+)
 
 
 REQUEST_SCHEMA = "verilog_causal_request"
@@ -133,6 +138,7 @@ class CausalAnalysisRequest:
     clock_signal: str
     endpoint: Endpoint
     semantic_inputs: Tuple[FileArtifact, ...]
+    search_policy: SearchPolicyIdentity
     bounds: Mapping[str, int]
     random_seed: int
     strict: bool
@@ -152,6 +158,7 @@ class CausalAnalysisRequest:
                 "clock",
                 "endpoint",
                 "semantic_inputs",
+                "search_policy",
                 "bounds",
                 "random_seed",
                 "strict",
@@ -336,8 +343,17 @@ class CausalAnalysisRequest:
                 "source annotations require feature source_provenance"
             )
 
+        try:
+            search_policy = SearchPolicyIdentity.from_dict(row["search_policy"])
+        except LocalSearchContractError as error:
+            raise ContractError(str(error)) from error
+
         required_bounds = {
+            "max_signal_depth",
             "max_signal_nodes",
+            "max_expanded_nodes",
+            "max_candidate_evaluations",
+            "max_intervention_evaluations",
             "max_semantic_nodes",
             "max_edges",
             "max_seed_count",
@@ -368,6 +384,7 @@ class CausalAnalysisRequest:
             clock_signal,
             endpoint,
             semantic_inputs,
+            search_policy,
             bounds,
             seed,
             strict,
@@ -413,6 +430,7 @@ class CausalAnalysisRequest:
                     key=lambda artifact: artifact.artifact_id,
                 )
             ],
+            "search_policy": self.search_policy.to_dict(),
             "bounds": dict(self.bounds),
             "random_seed": self.random_seed,
             "strict": self.strict,
@@ -467,6 +485,7 @@ def validate_graph(value: Mapping[str, Any]) -> Dict[str, Any]:
             "semantic_nodes",
             "edges",
             "root_candidates",
+            "search_summary",
             "bounds",
             "diagnostics",
         },
@@ -528,6 +547,10 @@ def validate_graph(value: Mapping[str, Any]) -> Dict[str, Any]:
         raise ContractError(
             "semantic graph contains invalid semantic IDs" + detail
         )
+    try:
+        validate_search_summary(value["search_summary"])
+    except LocalSearchContractError as error:
+        raise ContractError(str(error)) from error
     return dict(value)
 
 

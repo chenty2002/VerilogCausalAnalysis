@@ -29,6 +29,7 @@ from .endpoint_projection import (
 )
 from .structural_engine import PreparedCausalAnalysis, _convert_graph, _diagnostic
 from .identity import ANALYZER_REVISION, stable_id, stable_set_sha256
+from .local_search import make_search_summary
 from .instance_graph import InstanceGraph, InstanceGraphError
 from .temporal_semantics import build_c4_temporal_layer, c4_enabled
 from .waitfor_graph import (
@@ -129,10 +130,12 @@ def _structural_request(request: CausalAnalysisRequest):
         clock_signal=request.clock_signal,
         endpoint_signal=request.endpoint.signal,
         endpoint_cycle=request.endpoint.cycle,
-        max_depth=min(
-            request.bounds["max_signal_nodes"], _MAX_RAW_SLICE_DEPTH
-        ),
+        search_policy=request.search_policy.to_dict(),
+        max_depth=min(request.bounds["max_signal_depth"], _MAX_RAW_SLICE_DEPTH),
         max_nodes=request.bounds["max_signal_nodes"],
+        max_expanded_nodes=request.bounds["max_expanded_nodes"],
+        max_candidate_evaluations=request.bounds["max_candidate_evaluations"],
+        max_intervention_evaluations=request.bounds["max_intervention_evaluations"],
         random_seed=request.random_seed,
         strict=request.strict,
     )
@@ -202,6 +205,11 @@ def _empty_graph(
         "semantic_nodes": [],
         "edges": [],
         "root_candidates": [],
+        "search_summary": make_search_summary(
+            request.search_policy,
+            termination_reason="frontier_exhausted",
+            seed_count=1,
+        ),
         "bounds": {
             **dict(request.bounds),
             "signal_nodes_reached": False,
@@ -371,6 +379,17 @@ class PreparedCausalSession:
             _diagnostic(row["code"], row["message"])
             for row in self._provenance_diagnostics
         )
+        if request.search_policy.policy_id != "legacy_dfs_v1":
+            diagnostics.append(
+                _diagnostic(
+                    "search_policy_not_implemented",
+                    (
+                        f"policy {request.search_policy.policy_id} is contract-frozen "
+                        "but is not executable before LS-B/LS-C/LS-E"
+                    ),
+                )
+            )
+            return _empty_graph(request, diagnostics)
         projection = None
         if request.endpoint.evidence_ref is not None:
             artifact = next(
@@ -470,7 +489,7 @@ class PreparedCausalSession:
             self._prepared.parser,
             self._prepared.waveform,
             max_depth=min(
-                request.bounds["max_signal_nodes"], _MAX_RAW_SLICE_DEPTH
+                request.bounds["max_signal_depth"], _MAX_RAW_SLICE_DEPTH
             ),
             max_nodes=request.bounds["max_signal_nodes"],
             dependency_provider=provider,
@@ -527,7 +546,7 @@ class PreparedCausalSession:
                     self._prepared.parser,
                     self._prepared.waveform,
                     max_depth=min(
-                        request.bounds["max_signal_nodes"],
+                        request.bounds["max_signal_depth"],
                         _MAX_RAW_SLICE_DEPTH,
                     ),
                     max_nodes=request.bounds["max_signal_nodes"],
@@ -603,6 +622,24 @@ class PreparedCausalSession:
                 }.values(),
                 key=lambda row: (row["code"], row.get("message", "")),
             )
+        raw["search_summary"] = make_search_summary(
+            request.search_policy,
+            termination_reason=(
+                "max_signal_depth"
+                if raw["bounds"]["max_depth_reached"]
+                else (
+                    "max_signal_nodes"
+                    if raw["bounds"]["max_nodes_reached"]
+                    else raw["search_summary"]["termination_reason"]
+                )
+            ),
+            seed_count=len(raw_seed_signals),
+            expanded_nodes=len(raw["nodes"]),
+            candidate_evaluations=len(raw["edges"]),
+            admitted_nodes=len(raw["nodes"]),
+            admitted_edges=len(raw["edges"]),
+            exploit_expansions=len(raw["nodes"]),
+        )
         identity = _identity(request)
         node_ids: Dict[str, str] = {}
         signal_nodes = []
@@ -1251,6 +1288,7 @@ class PreparedCausalSession:
             "semantic_nodes": semantic_nodes,
             "edges": graph_edges,
             "root_candidates": root_candidates,
+            "search_summary": raw["search_summary"],
             "bounds": result_bounds,
             "diagnostics": all_diagnostics,
         }
@@ -1263,6 +1301,7 @@ class PreparedCausalSession:
                 "semantic_nodes": result["semantic_nodes"],
                 "edges": result["edges"],
                 "root_candidates": result["root_candidates"],
+                "search_summary": result["search_summary"],
                 "bounds": result["bounds"],
                 "diagnostics": result["diagnostics"],
             },

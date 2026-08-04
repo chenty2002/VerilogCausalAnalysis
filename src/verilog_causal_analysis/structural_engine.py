@@ -23,6 +23,7 @@ from .identity import (
     stable_id,
     stable_set_sha256,
 )
+from .local_search import make_search_summary
 from .verilog_parser import VerilogParser
 
 
@@ -113,21 +114,44 @@ def _empty_graph(
     status: str = "incomplete",
 ) -> Dict[str, Any]:
     identity = _graph_identity(request)
-    return {
+    result = {
         "schema_version": STRUCTURAL_GRAPH_SCHEMA,
-        "graph_id": stable_id("vcg_", identity),
+        "graph_id": "pending",
         "status": status,
         "identity": identity,
         "bounds": {
             "max_depth": request.max_depth,
             "max_nodes": request.max_nodes,
+            "max_expanded_nodes": request.max_expanded_nodes,
+            "max_candidate_evaluations": request.max_candidate_evaluations,
+            "max_intervention_evaluations": request.max_intervention_evaluations,
             "max_depth_reached": False,
             "max_nodes_reached": False,
         },
+        "search_summary": make_search_summary(
+            request.search_policy,
+            termination_reason="frontier_exhausted",
+            seed_count=1,
+        ),
         "nodes": [],
         "edges": [],
         "diagnostics": _sort_diagnostics(diagnostics),
     }
+    result["graph_id"] = stable_id(
+        "vcg_",
+        identity,
+        {
+            key: result[key]
+            for key in (
+                "bounds",
+                "search_summary",
+                "nodes",
+                "edges",
+                "diagnostics",
+            )
+        },
+    )
+    return result
 
 
 def _evidence_strength(edge: Mapping[str, Any]) -> Tuple[str, str]:
@@ -162,7 +186,6 @@ def _convert_graph(
     artifact_by_path: Mapping[str, str],
 ) -> Dict[str, Any]:
     identity = _graph_identity(request)
-    graph_id = stable_id("vcg_", identity)
     nodes_input = list(structural_nodes)
     edges_input = list(structural_edges)
     incoming = {str(edge["dst_node_id"]) for edge in edges_input}
@@ -368,9 +391,9 @@ def _convert_graph(
                 ),
             )
         )
-    return {
+    result = {
         "schema_version": STRUCTURAL_GRAPH_SCHEMA,
-        "graph_id": graph_id,
+        "graph_id": "pending",
         "status": (
             "incomplete"
             if any(item.get("breaks_complete") for item in diagnostics)
@@ -380,9 +403,36 @@ def _convert_graph(
         "bounds": {
             "max_depth": request.max_depth,
             "max_nodes": request.max_nodes,
+            "max_expanded_nodes": request.max_expanded_nodes,
+            "max_candidate_evaluations": request.max_candidate_evaluations,
+            "max_intervention_evaluations": request.max_intervention_evaluations,
             "max_depth_reached": max_depth_reached,
             "max_nodes_reached": max_nodes_reached,
         },
+        "search_summary": make_search_summary(
+            request.search_policy,
+            termination_reason=(
+                "max_signal_depth"
+                if max_depth_reached
+                else (
+                    "max_signal_nodes"
+                    if max_nodes_reached
+                    else (
+                        "max_candidate_evaluations"
+                        if max_work_reached
+                        else "frontier_exhausted"
+                    )
+                )
+            ),
+            seed_count=1,
+            expanded_nodes=len(nodes),
+            candidate_evaluations=int(
+                stats.get("candidate_evaluations", len(edges))
+            ),
+            admitted_nodes=len(nodes),
+            admitted_edges=len(edges),
+            exploit_expansions=len(nodes),
+        ),
         "nodes": sorted(
             nodes,
             key=lambda row: (
@@ -403,6 +453,21 @@ def _convert_graph(
         ),
         "diagnostics": _sort_diagnostics(diagnostics),
     }
+    result["graph_id"] = stable_id(
+        "vcg_",
+        identity,
+        {
+            key: result[key]
+            for key in (
+                "bounds",
+                "search_summary",
+                "nodes",
+                "edges",
+                "diagnostics",
+            )
+        },
+    )
+    return result
 
 
 class CausalPreparationError(RuntimeError):
@@ -816,6 +881,17 @@ class PreparedCausalAnalysis:
             )
 
         diagnostics: List[Dict[str, Any]] = []
+        if request.search_policy.policy_id != "legacy_dfs_v1":
+            diagnostics.append(
+                _diagnostic(
+                    "search_policy_not_implemented",
+                    (
+                        f"policy {request.search_policy.policy_id} is contract-frozen "
+                        "but is not executable before LS-B/LS-C/LS-E"
+                    ),
+                )
+            )
+            return _empty_graph(request, diagnostics, status="unsupported")
         if not self.waveform.has_exact_signal(request.endpoint_signal):
             diagnostics.append(
                 _diagnostic(
