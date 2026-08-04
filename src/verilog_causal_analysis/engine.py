@@ -47,6 +47,44 @@ from .provenance import (
 _MAX_RAW_SLICE_DEPTH = 256
 
 
+def _causal_provenance_hints(
+    hints: list[Dict[str, Any]],
+    parser: Any,
+    raw_edges: list[Mapping[str, Any]],
+    selected_statement_ids: set[str],
+) -> list[Dict[str, Any]]:
+    """Keep source hints attached to the active slice before budgeting."""
+
+    causal_lines: Dict[str, list[tuple[int, int]]] = {}
+    for edge in raw_edges:
+        evidence = edge.get("rtl_evidence")
+        if not isinstance(evidence, Mapping):
+            continue
+        artifact_id = str(evidence.get("artifact_id", ""))
+        start = int(evidence.get("line_start", 0) or 0)
+        end = int(evidence.get("line_end", start) or start)
+        if artifact_id and start > 0:
+            causal_lines.setdefault(artifact_id, []).append((start, max(start, end)))
+
+    result = []
+    statements = parser._statement_evidence
+    for hint in hints:
+        statement_id = str(hint["rtl_statement_id"])
+        if statement_id in selected_statement_ids:
+            result.append(hint)
+            continue
+        statement = statements.get(statement_id)
+        if statement is None:
+            continue
+        ranges = causal_lines.get(str(hint.get("rtl_artifact_id", "")), ())
+        if any(
+            statement.line_start <= end and statement.line_end >= start
+            for start, end in ranges
+        ):
+            result.append(hint)
+    return result
+
+
 class _SemanticBoundaryProvider:
     """Stop raw recursion at registers represented by C2 semantic objects."""
 
@@ -645,19 +683,18 @@ class PreparedCausalSession:
                     }
                 )
             if c6_enabled(request.semantic_profile.features):
-                referenced_statement_ids = {
+                selected_statement_ids = {
                     str(statement_id)
-                    for row in semantic_nodes
-                    for statement_id in row.get("statement_ids", [])
+                    for transition in selected_transitions
+                    for statement_id in transition["statement_ids"]
                 }
-                hints = self._normalized_design["provenance_hints"]
-                selected_hints = [
-                    row
-                    for row in hints
-                    if not referenced_statement_ids
-                    or row["rtl_statement_id"] in referenced_statement_ids
-                ]
-                for hint in selected_hints:
+                hints = _causal_provenance_hints(
+                    self._normalized_design["provenance_hints"],
+                    self._prepared.parser,
+                    raw["edges"],
+                    selected_statement_ids,
+                )
+                for hint in hints:
                     semantic_nodes.append(
                         {
                             **hint,

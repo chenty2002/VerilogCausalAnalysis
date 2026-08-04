@@ -16,6 +16,13 @@ _LOCATOR_RE = re.compile(
     r"@\[(?P<path>[A-Za-z0-9_./-]+\.scala)\s+"
     r"(?P<locator>[0-9]+:(?:[0-9]+|\{[0-9,]+\}))\]"
 )
+_CIRCT_LOCATOR_RE = re.compile(
+    r"(?P<path>[A-Za-z0-9_./-]+\.scala):"
+    r"(?P<line>[0-9]+):(?P<column>[0-9]+|\{[0-9,]+\})"
+)
+_CIRCT_SHORT_LOCATOR_RE = re.compile(
+    r"(?:^|,)\s*:(?P<line>[0-9]+):(?P<column>[0-9]+|\{[0-9,]+\})"
+)
 
 
 class ProvenanceError(ValueError):
@@ -143,20 +150,20 @@ def build_provenance_hints(
         start = max(0, statement.line_start - 4)
         end = min(len(lines), max(statement.line_end, statement.line_start))
         window = "\n".join(lines[start:end])
-        matches = list(_LOCATOR_RE.finditer(window))
+        matches = list(_locator_matches(window))
         if not matches:
             continue
-        nearest_offset = max(match.start() for match in matches)
+        nearest_offset = max(match[0] for match in matches)
         for match in matches:
-            if match.start() != nearest_offset:
+            if match[0] != nearest_offset:
                 continue
             _add_hint(
                 hints,
                 rtl_set_sha256=rtl_set_sha256,
                 rtl_artifact_id=artifact_by_module.get(statement.module_name),
                 statement_id=statement_id,
-                reported_path=match.group("path"),
-                reported_locator=match.group("locator"),
+                reported_path=match[1],
+                reported_locator=match[2],
                 status="unverified_hint",
                 inference_rule="firrtl_locator_comment",
                 annotation_sha256=None,
@@ -196,6 +203,35 @@ def build_provenance_hints(
         sorted(hints.values(), key=lambda item: item["hint_id"]),
         diagnostics,
     )
+
+
+def _locator_matches(text: str) -> list[tuple[int, str, str]]:
+    """Return both legacy FIRRTL and current CIRCT source locators."""
+
+    rows = [
+        (match.start(), match.group("path"), match.group("locator"))
+        for match in _LOCATOR_RE.finditer(text)
+    ]
+    rows.extend(
+        (
+            match.start(),
+            match.group("path"),
+            f"{match.group('line')}:{match.group('column')}",
+        )
+        for match in _CIRCT_LOCATOR_RE.finditer(text)
+    )
+    circt = list(_CIRCT_LOCATOR_RE.finditer(text))
+    if circt:
+        last = circt[-1]
+        rows.extend(
+            (
+                match.start(),
+                last.group("path"),
+                f"{match.group('line')}:{match.group('column')}",
+            )
+            for match in _CIRCT_SHORT_LOCATOR_RE.finditer(text, last.end())
+        )
+    return sorted(set(rows))
 
 
 def _add_hint(

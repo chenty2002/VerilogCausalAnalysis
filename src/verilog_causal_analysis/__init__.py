@@ -20,6 +20,7 @@ from .structural_contract import (
     make_structural_request,
     validate_structural_graph,
 )
+from .source_ranking import build_source_ranking
 from .identity import (
     ANALYZER_REVISION,
     HDLCONVERTOR_REVISION,
@@ -137,6 +138,7 @@ __all__ = [
     "WaitForError",
     "build_causal_graph",
     "build_structural_graph",
+    "build_source_ranking",
     "build_transition_intervals",
     "canonical_json_bytes",
     "canonical_sha256",

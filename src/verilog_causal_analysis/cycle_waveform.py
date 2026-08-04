@@ -274,6 +274,26 @@ class CycleAlignedWaveform:
 
         candidates = tuple(sorted(set(indexed_candidates)))
         if candidates:
+            direct = tuple(
+                candidate
+                for candidate in candidates
+                if self._normalize_signal_name(candidate) == normalized_signal
+            )
+            if len(direct) == 1:
+                result = SignalResolution(
+                    requested_signal=signal_name,
+                    hierarchy=hierarchy,
+                    resolved_signal=direct[0],
+                    candidates=direct,
+                    identity_strength=(
+                        "exact"
+                        if direct[0] == signal_name
+                        else "hierarchy_inferred"
+                    ),
+                    ambiguous=False,
+                )
+                self._resolution_cache[cache_key] = result
+                return result
             preferred = tuple(
                 candidate
                 for candidate in candidates
