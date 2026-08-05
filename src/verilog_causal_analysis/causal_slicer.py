@@ -1322,6 +1322,10 @@ class BackwardSlicer:
         perturb_value = invert_value(source_value)
         perturbed_env[perturb_key] = perturb_value
 
+        if self.stats["intervention_evaluations"] >= self.max_intervention_evaluations:
+            self.stats["intervention_evaluation_budget_reached"] = True
+            return False, 0.0, []
+        self.stats["intervention_evaluations"] += 1
         perturbed_result = context.compiled.evaluate(perturbed_env)
         if perturbed_result is None:
             return False, 0.0, []
@@ -1329,6 +1333,10 @@ class BackwardSlicer:
         is_causal = values_differ(orig_result, perturbed_result)
 
         if not is_causal and '==' in dep.expression:
+            if self.stats["intervention_evaluations"] >= self.max_intervention_evaluations:
+                self.stats["intervention_evaluation_budget_reached"] = True
+                return False, 0.0, []
+            self.stats["intervention_evaluations"] += 1
             smart_result = self._try_smart_perturbation(
                 dep,
                 env,
@@ -1737,6 +1745,7 @@ class BackwardSlicer:
         if self.search_policy is None or self.search_policy.policy_id in {
             "legacy_dfs_v1", "legacy_scalar_best_first_v1"
         }:
+            interventions_before = self.stats["intervention_evaluations"]
             is_causal, score, examples = self._evaluate_counterfactual(
                 node.signal, node.cycle, parent_node.signal, parent_cycle, dep, statement_dependencies
             )
@@ -1757,7 +1766,9 @@ class BackwardSlicer:
                 legacy_method=self._legacy_method(examples, is_causal),
                 legacy_score=score,
                 expression_evaluations=1,
-                intervention_evaluations=1 if any(row.get("type") == "counterfactual" for row in examples) else 0,
+                intervention_evaluations=(
+                    self.stats["intervention_evaluations"] - interventions_before
+                ),
                 change_examples=examples,
             )
             if self.search_policy is not None and self.search_policy.policy_id == "legacy_scalar_best_first_v1":
@@ -1772,8 +1783,8 @@ class BackwardSlicer:
             )
             is_causal = raw_evidence.status == "supported"
             weak = not is_causal
-            envelope = raw_evidence if is_causal else structural_evidence()
-            score = envelope.score
+            envelope = raw_evidence
+            score = raw_evidence.score
             examples = []
             feature_row = self._extract_score_features(parent_node, dep, envelope)
             local_score = score_features(self.search_policy, feature_row).local_score
@@ -1874,11 +1885,15 @@ class BackwardSlicer:
             )
             if result is not None:
                 evaluated.append(result)
+            if self.stats["intervention_evaluation_budget_reached"]:
+                break
         return self._admit_evaluated_candidates(node, evaluated)
 
     def _slice_node(self, node: CausalNode, depth: int):
         """Legacy recursive traversal over the shared expansion implementation."""
         for candidate in self._expand_node(node, depth):
+            if self.stats["intervention_evaluation_budget_reached"]:
+                break
             if not any(char in candidate.parent_node.value.lower() for char in ("x", "z")):
                 self._slice_node(candidate.parent_node, depth + 1)
 

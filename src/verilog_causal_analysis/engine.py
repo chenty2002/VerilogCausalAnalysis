@@ -562,6 +562,14 @@ class PreparedCausalSession:
             ambiguity_by_identity[key]
             for key in sorted(ambiguity_by_identity)
         ]
+        termination_reason = str(stats.get("termination_reason", "frontier_exhausted"))
+        if termination_reason != "frontier_exhausted":
+            diagnostics.append(
+                _diagnostic(
+                    "search_termination_incomplete",
+                    f"local search terminated at {termination_reason}",
+                )
+            )
         raw = _convert_graph(
             current_structural,
             (node.to_dict() for node in nodes.values()),

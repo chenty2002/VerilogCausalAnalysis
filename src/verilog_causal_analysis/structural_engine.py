@@ -946,6 +946,16 @@ class PreparedCausalAnalysis:
                 )
             )
             return _empty_graph(request, diagnostics)
+        termination_reason = str(
+            slicer.get_statistics().get("termination_reason", "frontier_exhausted")
+        )
+        if termination_reason != "frontier_exhausted":
+            diagnostics.append(
+                _diagnostic(
+                    "search_termination_incomplete",
+                    f"local search terminated at {termination_reason}",
+                )
+            )
         return _convert_graph(
             request,
             (node.to_dict() for node in nodes.values()),
