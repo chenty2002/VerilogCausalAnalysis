@@ -28,7 +28,9 @@ from .local_search import (
     FrontierScheduler,
     POLICY_REGISTRY,
     ScoreFeatures,
+    SearchSeed,
     SearchPolicy,
+    fanout_penalty,
     frontier_priority,
     path_support,
     score_features,
@@ -680,6 +682,9 @@ class BackwardSlicer:
                  dependency_provider: Optional[Any] = None,
                  search_policy: Optional[SearchPolicy | str] = None,
                  contribution_evaluator: Optional[Any] = None,
+                 heuristic_context: Optional[Any] = None,
+                 max_expanded_nodes: Optional[int] = None,
+                 max_candidate_evaluations: Optional[int] = None,
                  max_intervention_evaluations: Optional[int] = None,
                  ):
         """Initialize backward slicer with RTL parser and waveform data."""
@@ -693,7 +698,14 @@ class BackwardSlicer:
         # particular, none of these limits expands when max_depth changes.
         self.weak_edge_budget = max(0, (max_nodes - 1) // 4)
         self.weak_beam_width = 2
-        self.candidate_evaluation_budget = max_nodes * 8
+        self.candidate_evaluation_budget = (
+            max_nodes * 8
+            if max_candidate_evaluations is None
+            else max_candidate_evaluations
+        )
+        self.max_expanded_nodes = (
+            max_nodes if max_expanded_nodes is None else max_expanded_nodes
+        )
         self.temporal_lookback_budget = max(64, max_nodes * 8)
         self.temporal_value_budget = max(256, max_nodes * 32)
         self.exact_sva_trigger_cycle = exact_sva_trigger_cycle
@@ -704,6 +716,7 @@ class BackwardSlicer:
                 raise ValueError(f"unknown search policy {search_policy!r}") from error
         self.search_policy = search_policy
         self.contribution_evaluator = contribution_evaluator
+        self.heuristic_context = heuristic_context
         self.max_intervention_evaluations = (
             max_nodes * 32
             if max_intervention_evaluations is None
@@ -747,6 +760,8 @@ class BackwardSlicer:
             "intervention_evaluation_budget": self.max_intervention_evaluations,
             "intervention_evaluation_budget_reached": False,
             "expanded_nodes": 0,
+            "expanded_node_budget": self.max_expanded_nodes,
+            "expanded_node_budget_reached": False,
             "exploit_expansions": 0,
             "explore_expansions": 0,
             "statement_evaluations": 0,
@@ -770,6 +785,9 @@ class BackwardSlicer:
             "sva_window_end_cycle": None,  # The cycle when assertion failed (end of window)
             "sva_consequent_signals": None,  # Signals in the consequent part
             "exact_instance_waveform_misses": [],
+            "seed_count": 1,
+            "frontier_ids": [],
+            "termination_reason": "frontier_exhausted",
         }
     
     @staticmethod
@@ -1664,9 +1682,18 @@ class BackwardSlicer:
         if availability["C_ctrl"] != "available":
             values["C_ctrl"] = 0.85 if dep.dep_type == DependencyType.SEQUENTIAL else 0.7 if dep.condition else 0.3
             availability["C_ctrl"] = "available"
+        semantic = None
         if self.search_policy.policy_id == "chisel_hybrid_best_first_v1":
-            values["C_sem"] = 0.0
-            availability["C_sem"] = "available"
+            semantic = (
+                self.heuristic_context.get(parent_node.signal)
+                if self.heuristic_context is not None
+                else None
+            )
+            if semantic is None:
+                availability["C_sem"] = "not_available"
+            else:
+                values["C_sem"] = semantic.semantic_score
+                availability["C_sem"] = "available"
         else:
             availability["C_sem"] = "not_applicable"
         if availability["C_structural"] == "not_available":
@@ -1676,8 +1703,12 @@ class BackwardSlicer:
         penalty_values = {
             "P_unknown": 1.0 if unknown else 0.0,
             "P_ambiguity": 0.0 if parent_node.identity_strength == "exact" else 0.5 if parent_node.identity_strength == "hierarchy_inferred" else 1.0,
-            "P_temp": 0.0,
-            "P_fanout": 0.0,
+            "P_temp": (
+                1.0
+                if semantic is not None and semantic.compiler_temporary
+                else 0.0
+            ),
+            "P_fanout": fanout_penalty(len(self.dep_graph.get(dep.source, ()))),
         }
         for name, value in penalty_values.items():
             values[name] = value
@@ -1820,6 +1851,9 @@ class BackwardSlicer:
     def _expand_node(self, node: CausalNode, depth: int) -> List[CandidateExpansion]:
         if node.id in self.visited:
             return []
+        if self.stats["expanded_nodes"] >= self.max_expanded_nodes:
+            self.stats["expanded_node_budget_reached"] = True
+            return []
         self.visited.add(node.id)
         self.stats["expanded_nodes"] += 1
         parent_hierarchy, candidates, statement_groups = self._prepare_direct_candidates(node, depth)
@@ -1848,24 +1882,37 @@ class BackwardSlicer:
             if not any(char in candidate.parent_node.value.lower() for char in ("x", "z")):
                 self._slice_node(candidate.parent_node, depth + 1)
 
-    def _run_frontier(self, endpoint_node: CausalNode) -> None:
+    def _run_frontier(self, seeds: List[Tuple[SearchSeed, CausalNode]]) -> None:
         scheduler = FrontierScheduler(self.search_policy)
-        scheduler.push(
-            FrontierItem(
-                node_id=endpoint_node.id,
+        for seed, node in reversed(seeds):
+            semantic = (
+                self.heuristic_context.get(node.signal)
+                if self.heuristic_context is not None
+                else None
+            )
+            scheduler.push(FrontierItem(
+                node_id=node.id,
                 incoming_edge_id="seed",
-                depth=0,
-                seed_id="endpoint",
-                seed_rank=0,
-                seed_prior=1.0,
+                depth=node.depth,
+                seed_id=seed.seed_id,
+                seed_rank=seed.seed_rank,
+                seed_prior=seed.seed_prior,
                 local_score=1.0,
                 path_score=1.0,
-                frontier_priority=1.0,
+                frontier_priority=frontier_priority(
+                    1.0, 1.0, seed.seed_prior, self.search_policy
+                ),
                 support_scores=(),
-                source_group=self._extract_module_hierarchy(endpoint_node.signal),
-            )
-        )
+                source_group=(
+                    semantic.source_group
+                    if semantic is not None
+                    else self._extract_module_hierarchy(node.signal)
+                ),
+            ))
         while True:
+            if self.stats["expanded_nodes"] >= self.max_expanded_nodes:
+                self.stats["expanded_node_budget_reached"] = len(scheduler) > 0
+                break
             selection = scheduler.pop()
             if selection is None:
                 break
@@ -1877,6 +1924,11 @@ class BackwardSlicer:
                 parent = candidate.parent_node
                 if any(char in parent.value.lower() for char in ("x", "z")):
                     continue
+                semantic = (
+                    self.heuristic_context.get(parent.signal)
+                    if self.heuristic_context is not None
+                    else None
+                )
                 support_scores = selection.item.support_scores + (candidate.local_score,)
                 path_score = path_support(support_scores, self.search_policy)
                 priority = frontier_priority(
@@ -1898,9 +1950,30 @@ class BackwardSlicer:
                         path_score=path_score,
                         frontier_priority=priority,
                         support_scores=support_scores,
-                        source_group=self._extract_module_hierarchy(parent.signal),
+                        source_group=(
+                            semantic.source_group
+                            if semantic is not None
+                            else self._extract_module_hierarchy(parent.signal)
+                        ),
                     )
                 )
+            if self.stats["candidate_evaluation_budget_reached"] or self.stats["intervention_evaluation_budget_reached"]:
+                break
+        self.stats["frontier_ids"] = list(scheduler.remaining_ids())
+        if self.stats["intervention_evaluation_budget_reached"]:
+            self.stats["termination_reason"] = "max_intervention_evaluations"
+        elif self.stats["candidate_evaluation_budget_reached"]:
+            self.stats["termination_reason"] = "max_candidate_evaluations"
+        elif self.stats["expanded_node_budget_reached"]:
+            self.stats["termination_reason"] = "max_expanded_nodes"
+        elif self.stats["max_nodes_reached"]:
+            self.stats["termination_reason"] = "max_signal_nodes"
+        elif self.stats["max_depth_reached"]:
+            self.stats["termination_reason"] = "max_signal_depth"
+        elif self.stats.get("identity_ambiguities"):
+            self.stats["termination_reason"] = "identity_ambiguous"
+        elif self.stats["undetermined_nodes"]:
+            self.stats["termination_reason"] = "unknown_value_frontier"
     
     def _analyze_sva_time_window(self, 
                                   trigger_cycle: int,
@@ -2131,7 +2204,19 @@ class BackwardSlicer:
         else:
             # No time window - just do normal backward slicing from endpoint
             if self.search_policy is not None and self.search_policy.policy_id != "legacy_dfs_v1":
-                self._run_frontier(endpoint_node)
+                self._run_frontier([
+                    (
+                        SearchSeed(
+                            seed_id="endpoint",
+                            signal=endpoint_signal,
+                            cycle=original_endpoint_cycle,
+                            seed_kind="exact_endpoint",
+                            seed_prior=1.0,
+                            seed_rank=0,
+                        ),
+                        endpoint_node,
+                    )
+                ])
             else:
                 self._slice_node(endpoint_node, 0)
         
@@ -2140,7 +2225,79 @@ class BackwardSlicer:
         for node in self.nodes.values():
             if node.id not in nodes_with_incoming and not node.is_endpoint:
                 node.is_root = True
+        if self.stats["termination_reason"] == "frontier_exhausted":
+            if self.stats["intervention_evaluation_budget_reached"]:
+                self.stats["termination_reason"] = "max_intervention_evaluations"
+            elif self.stats["candidate_evaluation_budget_reached"]:
+                self.stats["termination_reason"] = "max_candidate_evaluations"
+            elif self.stats["expanded_node_budget_reached"]:
+                self.stats["termination_reason"] = "max_expanded_nodes"
+            elif self.stats["max_nodes_reached"]:
+                self.stats["termination_reason"] = "max_signal_nodes"
+            elif self.stats["max_depth_reached"]:
+                self.stats["termination_reason"] = "max_signal_depth"
+            elif self.stats.get("identity_ambiguities"):
+                self.stats["termination_reason"] = "identity_ambiguous"
+            elif self.stats["undetermined_nodes"]:
+                self.stats["termination_reason"] = "unknown_value_frontier"
         
+        return self.nodes, self.edges
+
+    def slice_from_seeds(
+        self, seeds: List[SearchSeed]
+    ) -> Tuple[Dict[str, CausalNode], List[CausalEdge]]:
+        """Run several exact seeds through one cache and one work budget."""
+
+        if not seeds:
+            raise ValueError("at least one search seed is required")
+        ordered = sorted(seeds, key=lambda row: (row.seed_rank, row.seed_id))
+        if len({row.seed_id for row in ordered}) != len(ordered):
+            raise ValueError("search seed IDs must be unique")
+        self.nodes = {}
+        self.edges = []
+        self.visited = set()
+        self._edge_set = set()
+        self._statement_evaluation_cache = {}
+        self.stats = self._new_stats()
+        self.stats["seed_count"] = len(ordered)
+        prepared: List[Tuple[SearchSeed, CausalNode]] = []
+        for seed in ordered:
+            node = self._get_or_create_node(
+                seed.signal,
+                seed.cycle,
+                0 if seed.seed_kind == "exact_endpoint" else 1,
+            )
+            if node is None:
+                continue
+            node.suspect_score = max(node.suspect_score, seed.seed_prior)
+            if seed.seed_kind == "exact_endpoint":
+                node.is_endpoint = True
+            prepared.append((seed, node))
+        if not prepared:
+            return {}, []
+        if self.search_policy is not None and self.search_policy.policy_id != "legacy_dfs_v1":
+            self._run_frontier(prepared)
+        else:
+            for _seed, node in prepared:
+                self._slice_node(node, 0)
+            if self.stats["intervention_evaluation_budget_reached"]:
+                self.stats["termination_reason"] = "max_intervention_evaluations"
+            elif self.stats["candidate_evaluation_budget_reached"]:
+                self.stats["termination_reason"] = "max_candidate_evaluations"
+            elif self.stats["expanded_node_budget_reached"]:
+                self.stats["termination_reason"] = "max_expanded_nodes"
+            elif self.stats["max_nodes_reached"]:
+                self.stats["termination_reason"] = "max_signal_nodes"
+            elif self.stats["max_depth_reached"]:
+                self.stats["termination_reason"] = "max_signal_depth"
+            elif self.stats.get("identity_ambiguities"):
+                self.stats["termination_reason"] = "identity_ambiguous"
+            elif self.stats["undetermined_nodes"]:
+                self.stats["termination_reason"] = "unknown_value_frontier"
+        nodes_with_incoming = {edge.dst_node_id for edge in self.edges}
+        for node in self.nodes.values():
+            if node.id not in nodes_with_incoming and not node.is_endpoint:
+                node.is_root = True
         return self.nodes, self.edges
     
     def get_statistics(self) -> Dict[str, Any]:

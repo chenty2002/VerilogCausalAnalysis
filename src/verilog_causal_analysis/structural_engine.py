@@ -301,6 +301,10 @@ def _convert_graph(
     max_depth_reached = bool(stats.get("max_depth_reached"))
     max_nodes_reached = bool(stats.get("max_nodes_reached"))
     max_work_reached = bool(stats.get("candidate_evaluation_budget_reached"))
+    max_expanded_reached = bool(stats.get("expanded_node_budget_reached"))
+    max_intervention_reached = bool(
+        stats.get("intervention_evaluation_budget_reached")
+    )
     temporal_work_reached = bool(
         stats.get("temporal_work_budget_reached")
     )
@@ -349,6 +353,20 @@ def _convert_graph(
                     f"candidate_evaluation_budget="
                     f"{stats.get('candidate_evaluation_budget')}"
                 ),
+            )
+        )
+    if max_expanded_reached:
+        diagnostics.append(
+            _diagnostic(
+                "graph_max_expanded_nodes_reached",
+                "causal slice reached max_expanded_nodes",
+            )
+        )
+    if max_intervention_reached:
+        diagnostics.append(
+            _diagnostic(
+                "graph_max_intervention_evaluations_reached",
+                "causal slice reached max_intervention_evaluations",
             )
         )
     if stats.get("sva_exact_trigger_missing"):
@@ -411,27 +429,18 @@ def _convert_graph(
         },
         "search_summary": make_search_summary(
             request.search_policy,
-            termination_reason=(
-                "max_signal_depth"
-                if max_depth_reached
-                else (
-                    "max_signal_nodes"
-                    if max_nodes_reached
-                    else (
-                        "max_candidate_evaluations"
-                        if max_work_reached
-                        else "frontier_exhausted"
-                    )
-                )
-            ),
-            seed_count=1,
-            expanded_nodes=len(nodes),
+            termination_reason=str(stats.get("termination_reason", "frontier_exhausted")),
+            seed_count=int(stats.get("seed_count", 1)),
+            expanded_nodes=int(stats.get("expanded_nodes", len(nodes))),
             candidate_evaluations=int(
                 stats.get("candidate_evaluations", len(edges))
             ),
+            intervention_evaluations=int(stats.get("intervention_evaluations", 0)),
             admitted_nodes=len(nodes),
             admitted_edges=len(edges),
-            exploit_expansions=len(nodes),
+            exploit_expansions=int(stats.get("exploit_expansions", 0)),
+            explore_expansions=int(stats.get("explore_expansions", 0)),
+            frontier_ids=stats.get("frontier_ids", ()),
         ),
         "nodes": sorted(
             nodes,
@@ -881,17 +890,6 @@ class PreparedCausalAnalysis:
             )
 
         diagnostics: List[Dict[str, Any]] = []
-        if request.search_policy.policy_id != "legacy_dfs_v1":
-            diagnostics.append(
-                _diagnostic(
-                    "search_policy_not_implemented",
-                    (
-                        f"policy {request.search_policy.policy_id} is contract-frozen "
-                        "but is not executable before LS-B/LS-C/LS-E"
-                    ),
-                )
-            )
-            return _empty_graph(request, diagnostics, status="unsupported")
         if not self.waveform.has_exact_signal(request.endpoint_signal):
             diagnostics.append(
                 _diagnostic(
@@ -931,6 +929,10 @@ class PreparedCausalAnalysis:
             self.waveform,
             max_depth=request.max_depth,
             max_nodes=request.max_nodes,
+            search_policy=request.search_policy.policy_id,
+            max_expanded_nodes=request.max_expanded_nodes,
+            max_candidate_evaluations=request.max_candidate_evaluations,
+            max_intervention_evaluations=request.max_intervention_evaluations,
         )
         nodes, edges = slicer.slice_from_endpoint(
             request.endpoint_signal,

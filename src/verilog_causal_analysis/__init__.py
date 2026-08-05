@@ -32,6 +32,7 @@ from .local_search import (
     FrontierSelection,
     ScoreFeatures,
     ScoreResult,
+    SearchSeed,
     SearchPolicy,
     SearchPolicyIdentity,
     make_search_summary,
@@ -106,9 +107,12 @@ from .waitfor_graph import (
     validate_protocol_adapter,
 )
 from .provenance import (
+    HeuristicFeature,
+    HeuristicFeatureIndex,
     SOURCE_ANNOTATION_SCHEMA,
     SOURCE_PROVENANCE_FEATURE,
     ProvenanceError,
+    build_heuristic_feature_index,
 )
 from .semantic_query import (
     SemanticGraphQueryError,
@@ -205,12 +209,16 @@ __all__ = [
     "ScoreResult",
     "SearchPolicy",
     "SearchPolicyIdentity",
+    "SearchSeed",
+    "HeuristicFeature",
+    "HeuristicFeatureIndex",
     "TEMPORAL_FEATURE",
     "WAITFOR_FEATURE",
     "WaitForError",
     "build_causal_graph",
     "build_structural_graph",
     "build_source_ranking",
+    "build_heuristic_feature_index",
     "build_transition_intervals",
     "adapt_legacy_contribution",
     "canonical_json_bytes",

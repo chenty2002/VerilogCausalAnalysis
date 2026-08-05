@@ -6,6 +6,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
 
+from .identity import canonical_sha256, stable_id
+
 
 _LOCATOR_RE = re.compile(
     r"(?P<path>[A-Za-z0-9_./-]+\.scala):"
@@ -69,6 +71,7 @@ def build_source_ranking(
                 score=float(node.get("suspect_score", 0.0) or 0.0),
                 instance=instance,
                 evidence_ids=(node_id,),
+                semantic_role="state" if not node.get("is_slice_leaf") else "data",
             )
 
     for edge in graph.get("edges", []):
@@ -93,6 +96,13 @@ def build_source_ranking(
         score = float(
             edge.get("contribution_score", edge.get("dynamic_score", 0.0)) or 0.0
         )
+        role = (
+            "control"
+            if str(evidence.get("condition", ""))
+            else "state"
+            if edge.get("dependency_type") == "sequential"
+            else "data"
+        )
         for locator in _locators(str(evidence.get("snippet", ""))):
             _merge(
                 candidates,
@@ -100,6 +110,7 @@ def build_source_ranking(
                 score=score,
                 instance=instance,
                 evidence_ids=evidence_ids,
+                semantic_role=role,
             )
 
     for semantic in graph.get("semantic_nodes", []):
@@ -115,10 +126,45 @@ def build_source_ranking(
                     "line": int(match.group("line")),
                     "column": _column(match.group("column")),
                 },
-                score=0.0,
+                score=(
+                    0.4
+                    if semantic.get("status") == "unverified_hint"
+                    else 1.0
+                    if semantic.get("status") == "source_projection_candidate"
+                    else 0.0
+                ),
                 instance="",
                 evidence_ids=(str(semantic.get("semantic_id", "")),),
+                semantic_role="source",
+                source_authority=str(semantic.get("authority", "non_authoritative")),
             )
+
+    coverage_frontiers = sorted(
+        str(node_id)
+        for node_id, node in nodes.items()
+        if node.get("is_slice_leaf") and node.get("rtl_context_status") == "missing"
+    )
+    trigger_candidates = sorted(
+        str(node_id)
+        for node_id, node in nodes.items()
+        if node.get("is_slice_leaf") and node.get("rtl_context_status") != "missing"
+    )
+    for row in candidates.values():
+        groups = sorted(row.pop("_groups").values(), key=lambda item: item["evidence_group_id"])
+        role_best: Dict[str, float] = {}
+        for group in groups:
+            role_best[group["semantic_role"]] = max(
+                role_best.get(group["semantic_role"], 0.0), group["score"]
+            )
+        best = max(role_best.values(), default=0.0)
+        top_roles = sorted(role_best.values(), reverse=True)[:2]
+        role_mean = sum(top_roles) / len(top_roles) if top_roles else 0.0
+        rootness = best
+        row["score"] = round(min(1.0, 0.65 * best + 0.25 * role_mean + 0.10 * rootness), 6)
+        row["evidence_groups"] = groups
+        row["evidence_group_ids"] = [item["evidence_group_id"] for item in groups]
+        row["semantic_roles"] = sorted(role_best)
+        row["best_path_ids"] = []
 
     rows = sorted(
         candidates.values(),
@@ -144,8 +190,24 @@ def build_source_ranking(
         "method": method,
         "status": "complete" if any(row["evidence_node_ids"] for row in rows) else "rtl_only",
         "graph_id": graph.get("graph_id"),
+        "policy_id": (graph.get("search_summary") or {}).get("policy_id"),
+        "source_projection_status": (
+            "incomplete"
+            if any(
+                item.get("type") == "source_provenance_hint"
+                and item.get("status") == "ambiguous"
+                for item in graph.get("semantic_nodes", [])
+            )
+            else "candidate"
+            if any(row["evidence_group_ids"] for row in rows)
+            else "rtl_only"
+        ),
         "ordering": rows,
+        "candidates": rows,
+        "coverage_frontiers": coverage_frontiers,
+        "trigger_candidates": trigger_candidates,
         "tie_rule": "score_then_evidence_count_then_source_location",
+        "ranking_sha256": canonical_sha256(rows),
     }
 
 
@@ -184,6 +246,8 @@ def _merge(
     score: float,
     instance: str,
     evidence_ids: Sequence[str],
+    semantic_role: str = "data",
+    source_authority: str = "non_authoritative",
 ) -> None:
     path = str(locator.get("path", ""))
     line = int(locator.get("line", 0) or 0)
@@ -200,13 +264,36 @@ def _merge(
             "line": line,
             "column": _column(locator.get("column", 1)),
             "evidence_node_ids": [],
+            "source_authority": source_authority,
+            "_groups": {},
         },
     )
-    # Compiler temporaries that map to one statement contribute once.
-    if score > row["score"]:
-        row["score"] = round(score, 6)
+    group_identity = {
+        "instance": instance,
+        "file": path,
+        "line": line,
+        "semantic_role": semantic_role,
+    }
+    group_id = stable_id("vceg_", group_identity, length=24)
+    group = row["_groups"].setdefault(
+        group_id,
+        {
+            "evidence_group_id": group_id,
+            "semantic_role": semantic_role,
+            "score": 0.0,
+            "evidence_ids": [],
+        },
+    )
+    # Repeated compiler nets/cycles in one statement-role group contribute once.
+    group["score"] = round(max(group["score"], max(0.0, min(1.0, score))), 6)
+    group["evidence_ids"] = sorted(
+        set(group["evidence_ids"]) | {item for item in evidence_ids if item}
+    )
+    row["score"] = max(row["score"], group["score"])
     if instance and (not row["instance"] or instance < row["instance"]):
         row["instance"] = instance
     row["evidence_node_ids"] = sorted(
         set(row["evidence_node_ids"]) | {item for item in evidence_ids if item}
     )
+    if source_authority < row["source_authority"]:
+        row["source_authority"] = source_authority

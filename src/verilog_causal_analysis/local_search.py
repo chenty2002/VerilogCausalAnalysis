@@ -478,6 +478,34 @@ class FrontierItem:
 
 
 @dataclass(frozen=True)
+class SearchSeed:
+    """One deterministic entry point into a shared bounded search."""
+
+    seed_id: str
+    signal: str
+    cycle: int
+    seed_kind: str
+    seed_prior: float
+    seed_rank: int
+    identity_strength: str = "exact"
+
+    def __post_init__(self) -> None:
+        if not self.seed_id or not self.signal:
+            raise LocalSearchContractError("search seed ID and signal must be non-empty")
+        _non_negative_int(self.cycle, "search_seed.cycle")
+        _non_negative_int(self.seed_rank, "search_seed.seed_rank")
+        _finite_unit(self.seed_prior, "search_seed.seed_prior")
+        if self.seed_kind not in {
+            "exact_endpoint",
+            "exact_predicate_member",
+            "derived_active_guard",
+        }:
+            raise LocalSearchContractError("search seed kind is invalid")
+        if self.identity_strength != "exact":
+            raise LocalSearchContractError("search seeds require exact identity")
+
+
+@dataclass(frozen=True)
 class FrontierSelection:
     item: FrontierItem
     lane: str
@@ -504,6 +532,9 @@ class FrontierScheduler:
 
     def __len__(self) -> int:
         return sum(node_id not in self._expanded for node_id in self._best)
+
+    def remaining_ids(self) -> Tuple[str, ...]:
+        return tuple(sorted(node_id for node_id in self._best if node_id not in self._expanded))
 
     @staticmethod
     def _better(new: FrontierItem, old: FrontierItem) -> bool:

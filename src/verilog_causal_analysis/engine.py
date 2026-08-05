@@ -29,7 +29,7 @@ from .endpoint_projection import (
 )
 from .structural_engine import PreparedCausalAnalysis, _convert_graph, _diagnostic
 from .identity import ANALYZER_REVISION, stable_id, stable_set_sha256
-from .local_search import make_search_summary
+from .local_search import SearchSeed, make_search_summary
 from .instance_graph import InstanceGraph, InstanceGraphError
 from .temporal_semantics import build_c4_temporal_layer, c4_enabled
 from .waitfor_graph import (
@@ -40,6 +40,7 @@ from .waitfor_graph import (
 )
 from .provenance import (
     ProvenanceError,
+    build_heuristic_feature_index,
     build_provenance_hints,
     c6_enabled,
     load_source_annotations,
@@ -347,6 +348,9 @@ class PreparedCausalSession:
                     )
                     projected_paths.add(scope)
         self._closed = False
+        self._heuristic_features = build_heuristic_feature_index(
+            self._normalized_design
+        )
 
     @property
     def normalized_design(self) -> Dict[str, Any]:
@@ -379,17 +383,6 @@ class PreparedCausalSession:
             _diagnostic(row["code"], row["message"])
             for row in self._provenance_diagnostics
         )
-        if request.search_policy.policy_id != "legacy_dfs_v1":
-            diagnostics.append(
-                _diagnostic(
-                    "search_policy_not_implemented",
-                    (
-                        f"policy {request.search_policy.policy_id} is contract-frozen "
-                        "but is not executable before LS-B/LS-C/LS-E"
-                    ),
-                )
-            )
-            return _empty_graph(request, diagnostics)
         projection = None
         if request.endpoint.evidence_ref is not None:
             artifact = next(
@@ -485,6 +478,62 @@ class PreparedCausalSession:
             )
             return _empty_graph(request, diagnostics)
 
+        raw_seed_signals = [request.endpoint.signal]
+        seeds = [
+            SearchSeed(
+                seed_id=stable_id(
+                    "vcss_", request.endpoint.signal, request.endpoint.cycle,
+                    "exact_endpoint", length=24,
+                ),
+                signal=request.endpoint.signal,
+                cycle=request.endpoint.cycle,
+                seed_kind="exact_endpoint",
+                seed_prior=1.0,
+                seed_rank=0,
+            )
+        ]
+        extra_seeds: list[tuple[str, str, float]] = []
+        extra_seeds.extend(
+            (member, "exact_predicate_member", 0.9)
+            for member in sorted(projection_members)
+            if member != request.endpoint.signal
+            and self._prepared.waveform.has_exact_signal(member)
+        )
+        if self._normalized_design is not None and c4_enabled(
+            request.semantic_profile.features
+        ):
+            extra_seeds.extend(
+                (member, "derived_active_guard", 0.75)
+                for member in sorted(
+                    {
+                        str(member)
+                        for transition in selected_transitions
+                        for rule in list(transition["update_rules"])
+                        + list(transition["reset_rules"])
+                        for member in rule.get("guard_members", [])
+                        if self._prepared.waveform.has_exact_signal(str(member))
+                    }
+                )
+            )
+        seen_seed_signals = {request.endpoint.signal}
+        for signal, kind, prior in extra_seeds:
+            if signal in seen_seed_signals or len(seeds) >= request.bounds["max_seed_count"]:
+                continue
+            seen_seed_signals.add(signal)
+            raw_seed_signals.append(signal)
+            seeds.append(
+                SearchSeed(
+                    seed_id=stable_id(
+                        "vcss_", signal, request.endpoint.cycle, kind, length=24
+                    ),
+                    signal=signal,
+                    cycle=request.endpoint.cycle,
+                    seed_kind=kind,
+                    seed_prior=prior,
+                    seed_rank=len(seeds),
+                )
+            )
+
         slicer = BackwardSlicer(
             self._prepared.parser,
             self._prepared.waveform,
@@ -493,10 +542,13 @@ class PreparedCausalSession:
             ),
             max_nodes=request.bounds["max_signal_nodes"],
             dependency_provider=provider,
+            search_policy=request.search_policy.policy_id,
+            heuristic_context=self._heuristic_features,
+            max_expanded_nodes=request.bounds["max_expanded_nodes"],
+            max_candidate_evaluations=request.bounds["max_candidate_evaluations"],
+            max_intervention_evaluations=request.bounds["max_intervention_evaluations"],
         )
-        nodes, edges = slicer.slice_from_endpoint(
-            request.endpoint.signal, request.endpoint.cycle
-        )
+        nodes, edges = slicer.slice_from_seeds(seeds)
         stats = dict(slicer.get_statistics())
         ambiguity_by_identity: Dict[tuple[str, int], Dict[str, Any]] = {}
         for row in stats.get("identity_ambiguities") or []:
@@ -518,127 +570,25 @@ class PreparedCausalSession:
             diagnostics,
             self._prepared.artifact_by_path,
         )
-        raw_seed_signals = [request.endpoint.signal]
-        if (
-            self._normalized_design is not None
-            and c4_enabled(request.semantic_profile.features)
-        ):
-            derived_seed_signals = sorted(
-                {
-                    str(member)
-                    for transition in selected_transitions
-                    for rule in list(transition["update_rules"])
-                    + list(transition["reset_rules"])
-                    for member in rule.get("guard_members", [])
-                    if self._prepared.waveform.has_exact_signal(str(member))
-                    and str(member) != request.endpoint.signal
-                }
-            )[: max(0, request.bounds["max_seed_count"] - 1)]
-            raw_seed_signals.extend(derived_seed_signals)
-            raw_nodes = {
-                str(row["node_id"]): dict(row) for row in raw["nodes"]
-            }
-            raw_edges = {
-                str(row["edge_id"]): dict(row) for row in raw["edges"]
-            }
-            for seed_signal in derived_seed_signals:
-                seed_slicer = BackwardSlicer(
-                    self._prepared.parser,
-                    self._prepared.waveform,
-                    max_depth=min(
-                        request.bounds["max_signal_depth"],
-                        _MAX_RAW_SLICE_DEPTH,
-                    ),
-                    max_nodes=request.bounds["max_signal_nodes"],
-                    dependency_provider=provider,
-                )
-                seed_nodes, seed_edges = seed_slicer.slice_from_endpoint(
-                    seed_signal, request.endpoint.cycle
-                )
-                seed_raw = _convert_graph(
-                    current_structural,
-                    (node.to_dict() for node in seed_nodes.values()),
-                    (edge.to_dict() for edge in seed_edges),
-                    dict(seed_slicer.get_statistics()),
-                    [],
-                    self._prepared.artifact_by_path,
-                )
-                for row in seed_raw["nodes"]:
-                    raw_nodes.setdefault(str(row["node_id"]), dict(row))
-                for row in seed_raw["edges"]:
-                    raw_edges.setdefault(str(row["edge_id"]), dict(row))
-                raw["diagnostics"].extend(seed_raw["diagnostics"])
-                raw["bounds"]["max_depth_reached"] = bool(
-                    raw["bounds"]["max_depth_reached"]
-                    or seed_raw["bounds"]["max_depth_reached"]
-                )
-                raw["bounds"]["max_nodes_reached"] = bool(
-                    raw["bounds"]["max_nodes_reached"]
-                    or seed_raw["bounds"]["max_nodes_reached"]
-                )
-            retained_raw_ids = {
-                str(row["node_id"])
-                for row in sorted(
-                    raw_nodes.values(),
-                    key=lambda row: (
-                        int(row.get("depth", 0)),
-                        str(row["node_id"]),
-                    ),
-                )[: request.bounds["max_signal_nodes"]]
-            }
-            if len(raw_nodes) > len(retained_raw_ids):
-                raw["bounds"]["max_nodes_reached"] = True
-                raw["diagnostics"].append(
-                    _diagnostic(
-                        "graph_max_nodes_reached",
-                        "C4 merged multi-seed graph reached max_signal_nodes",
-                    )
-                )
-            raw["nodes"] = sorted(
-                (
-                    row
-                    for node_id, row in raw_nodes.items()
-                    if node_id in retained_raw_ids
-                ),
-                key=lambda row: str(row["node_id"]),
-            )
-            raw["edges"] = sorted(
-                (
-                    row
-                    for row in raw_edges.values()
-                    if str(row["src_node_id"]) in retained_raw_ids
-                    and str(row["dst_node_id"]) in retained_raw_ids
-                ),
-                key=lambda row: str(row["edge_id"]),
-            )
-            raw["diagnostics"] = sorted(
-                {
-                    (
-                        str(row["code"]),
-                        str(row.get("message", "")),
-                        bool(row.get("breaks_complete", False)),
-                    ): row
-                    for row in raw["diagnostics"]
-                }.values(),
-                key=lambda row: (row["code"], row.get("message", "")),
-            )
         raw["search_summary"] = make_search_summary(
             request.search_policy,
             termination_reason=(
-                "max_signal_depth"
-                if raw["bounds"]["max_depth_reached"]
-                else (
-                    "max_signal_nodes"
-                    if raw["bounds"]["max_nodes_reached"]
-                    else raw["search_summary"]["termination_reason"]
+                "source_projection_ambiguous"
+                if any(
+                    row.get("code") == "source_projection_ambiguous"
+                    for row in diagnostics
                 )
+                else str(stats["termination_reason"])
             ),
             seed_count=len(raw_seed_signals),
-            expanded_nodes=len(raw["nodes"]),
-            candidate_evaluations=len(raw["edges"]),
+            expanded_nodes=int(stats["expanded_nodes"]),
+            candidate_evaluations=int(stats["candidate_evaluations"]),
+            intervention_evaluations=int(stats["intervention_evaluations"]),
             admitted_nodes=len(raw["nodes"]),
             admitted_edges=len(raw["edges"]),
-            exploit_expansions=len(raw["nodes"]),
+            exploit_expansions=int(stats["exploit_expansions"]),
+            explore_expansions=int(stats["explore_expansions"]),
+            frontier_ids=stats.get("frontier_ids", ()),
         )
         identity = _identity(request)
         node_ids: Dict[str, str] = {}

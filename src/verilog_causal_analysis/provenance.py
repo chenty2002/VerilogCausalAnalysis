@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Dict, Iterable, Mapping, Optional
 
 from .identity import canonical_sha256, sha256_file, stable_id
@@ -27,6 +29,78 @@ _CIRCT_SHORT_LOCATOR_RE = re.compile(
 
 class ProvenanceError(ValueError):
     """A source sidecar or locator cannot be joined without guessing."""
+
+
+@dataclass(frozen=True)
+class HeuristicFeature:
+    semantic_score: float
+    source_group: str
+    compiler_temporary: bool
+
+
+class HeuristicFeatureIndex:
+    """Small, read-only semantic index used only by frontier scoring."""
+
+    def __init__(self, rows: Mapping[str, HeuristicFeature]):
+        self._rows = MappingProxyType(dict(rows))
+
+    @staticmethod
+    def _clean(signal: str) -> str:
+        return re.sub(r"\s*\[\d+:\d+\]$", "", signal)
+
+    def get(self, signal: str) -> Optional[HeuristicFeature]:
+        return self._rows.get(self._clean(signal))
+
+
+def build_heuristic_feature_index(
+    normalized_design: Optional[Mapping[str, Any]],
+) -> HeuristicFeatureIndex:
+    """Collapse aliases and compiler nets before search feature lookup."""
+
+    if normalized_design is None:
+        return HeuristicFeatureIndex({})
+    rows: Dict[str, HeuristicFeature] = {}
+
+    def add(signals: Iterable[Any], score: float, group: str, temporary: bool = False) -> None:
+        for value in signals:
+            signal = HeuristicFeatureIndex._clean(str(value))
+            candidate = HeuristicFeature(score, group, temporary)
+            current = rows.get(signal)
+            if current is None or (candidate.semantic_score, candidate.source_group) > (
+                current.semantic_score,
+                current.source_group,
+            ):
+                rows[signal] = candidate
+
+    for alias in normalized_design.get("alias_classes", []):
+        group = str(alias["alias_id"])
+        canonical = str(alias["canonical_signal"])
+        add(
+            alias.get("members", []),
+            0.65,
+            group,
+        )
+        # The canonical member must never be penalized as a temporary.
+        canonical = HeuristicFeatureIndex._clean(canonical)
+        if canonical in rows:
+            rows[canonical] = HeuristicFeature(rows[canonical].semantic_score, group, False)
+    for expression in normalized_design.get("expression_groups", []):
+        group = str(expression["expression_id"])
+        add(expression.get("member_signals", []), 0.65, group, True)
+        add(expression.get("leaf_inputs", []), 0.65, group)
+    for transition in normalized_design.get("register_transitions", []):
+        add((transition.get("signal"),), 1.0, str(transition["register_id"]))
+        for rule in list(transition.get("reset_rules", [])) + list(transition.get("update_rules", [])):
+            add(rule.get("guard_members", []), 1.0, str(transition["register_id"]))
+            add(rule.get("value_members", []), 0.8, str(transition["register_id"]))
+    for collection, identifier in (
+        ("aggregates", "aggregate_id"),
+        ("handshakes", "handshake_id"),
+        ("pipelines", "pipeline_id"),
+    ):
+        for item in normalized_design.get(collection, []):
+            add(item.get("member_signals", []), 1.0, str(item[identifier]))
+    return HeuristicFeatureIndex(rows)
 
 
 def c6_enabled(features: Iterable[str]) -> bool:
