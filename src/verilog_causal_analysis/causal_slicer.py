@@ -746,6 +746,29 @@ class BackwardSlicer:
         self._re_sva_time_window = re.compile(r'##\[(\d+):(\d+)\]|##(\d+)')
         
         self.stats = self._new_stats()
+        self.search_trace: List[Dict[str, Any]] = []
+
+    def _record_search_event(self, event: str, **payload: Any) -> None:
+        """Record observed search work without influencing traversal state."""
+
+        self.search_trace.append(
+            {
+                "sequence": len(self.search_trace),
+                "event": event,
+                **payload,
+                "cumulative": {
+                    "expanded_nodes": int(self.stats["expanded_nodes"]),
+                    "candidate_evaluations": int(
+                        self.stats["candidate_evaluations"]
+                    ),
+                    "intervention_evaluations": int(
+                        self.stats["intervention_evaluations"]
+                    ),
+                    "admitted_nodes": len(self.nodes),
+                    "admitted_edges": len(self.edges),
+                },
+            }
+        )
 
     def _new_stats(self) -> Dict[str, Any]:
         return {
@@ -1739,6 +1762,12 @@ class BackwardSlicer:
         )
         if parent_node.id == node.id or (parent_node.id, node.id) in self._edge_set:
             self.stats["rejected_candidates"] += 1
+            self._record_search_event(
+                "candidate_rejection",
+                target_node_id=node.id,
+                parent_node_id=parent_node.id,
+                reason="self_or_duplicate_edge",
+            )
             return None
         self.stats["candidate_evaluations"] += 1
 
@@ -1788,10 +1817,20 @@ class BackwardSlicer:
             examples = []
             feature_row = self._extract_score_features(parent_node, dep, envelope)
             local_score = score_features(self.search_policy, feature_row).local_score
-        return CandidateExpansion(
+        result = CandidateExpansion(
             dep, parent_cycle, parent_node, parent_is_new, is_causal, weak,
             score, envelope, examples, local_score, feature_row,
         )
+        self._record_search_event(
+            "candidate_evaluation",
+            target_node_id=node.id,
+            parent_node_id=parent_node.id,
+            contribution_status=envelope.to_dict().get("status"),
+            contribution_score=score,
+            local_score=local_score,
+            weak_candidate=weak,
+        )
+        return result
 
     def _admit_evaluated_candidates(
         self, node: CausalNode, evaluated: List[CandidateExpansion]
@@ -1809,12 +1848,24 @@ class BackwardSlicer:
         weak_for_target = 0
         for candidate in evaluated:
             if (candidate.parent_node.id, node.id) in self._edge_set:
+                self._record_search_event(
+                    "candidate_rejection",
+                    target_node_id=node.id,
+                    parent_node_id=candidate.parent_node.id,
+                    reason="duplicate_edge",
+                )
                 continue
             if candidate.weak_candidate and (
                 self.stats["weak_edges_admitted"] >= self.weak_edge_budget
                 or weak_for_target >= self.weak_beam_width
             ):
                 self.stats["rejected_candidates"] += 1
+                self._record_search_event(
+                    "candidate_rejection",
+                    target_node_id=node.id,
+                    parent_node_id=candidate.parent_node.id,
+                    reason="weak_edge_budget",
+                )
                 continue
             dep = candidate.dep
             if dep.dep_type == DependencyType.SEQUENTIAL:
@@ -1849,6 +1900,12 @@ class BackwardSlicer:
             )
             committed = self._commit_candidate(candidate.parent_node, candidate.parent_is_new, edge)
             if committed is None:
+                self._record_search_event(
+                    "candidate_rejection",
+                    target_node_id=node.id,
+                    parent_node_id=candidate.parent_node.id,
+                    reason="graph_capacity",
+                )
                 continue
             candidate.parent_node = committed
             candidate.edge = edge
@@ -1857,6 +1914,15 @@ class BackwardSlicer:
                 self.stats["weak_edges_admitted"] += 1
             committed.suspect_score = max(committed.suspect_score, candidate.contribution_score * 0.9)
             admitted.append(candidate)
+            self._record_search_event(
+                "candidate_admission",
+                target_node_id=node.id,
+                parent_node_id=committed.id,
+                edge_id=hashlib.md5(
+                    f"{committed.id}->{node.id}".encode()
+                ).hexdigest()[:12],
+                weak_candidate=candidate.weak_candidate,
+            )
         return admitted
 
     def _expand_node(self, node: CausalNode, depth: int) -> List[CandidateExpansion]:
@@ -1891,6 +1957,12 @@ class BackwardSlicer:
 
     def _slice_node(self, node: CausalNode, depth: int):
         """Legacy recursive traversal over the shared expansion implementation."""
+        self._record_search_event(
+            "frontier_selection",
+            node_id=node.id,
+            depth=depth,
+            lane="legacy_dfs",
+        )
         for candidate in self._expand_node(node, depth):
             if self.stats["intervention_evaluation_budget_reached"]:
                 break
@@ -1932,6 +2004,14 @@ class BackwardSlicer:
             if selection is None:
                 break
             self.stats[f"{selection.lane}_expansions"] += 1
+            self._record_search_event(
+                "frontier_selection",
+                node_id=selection.item.node_id,
+                depth=selection.item.depth,
+                lane=selection.lane,
+                frontier_priority=selection.item.frontier_priority,
+                seed_id=selection.item.seed_id,
+            )
             node = self.nodes.get(selection.item.node_id)
             if node is None:
                 continue
@@ -2107,6 +2187,7 @@ class BackwardSlicer:
         self._edge_set = set()  # Track edges to prevent duplicates
         self._statement_evaluation_cache = {}
         self.stats = self._new_stats()
+        self.search_trace = []
         
         original_endpoint_cycle = endpoint_cycle  # This is the failure cycle
         hierarchy = self._extract_module_hierarchy(endpoint_signal)
@@ -2288,6 +2369,14 @@ class BackwardSlicer:
             if seed.seed_kind == "exact_endpoint":
                 node.is_endpoint = True
             prepared.append((seed, node))
+            self._record_search_event(
+                "seed",
+                node_id=node.id,
+                seed_id=seed.seed_id,
+                seed_kind=seed.seed_kind,
+                seed_rank=seed.seed_rank,
+                seed_prior=seed.seed_prior,
+            )
         if not prepared:
             return {}, []
         if self.search_policy is not None and self.search_policy.policy_id != "legacy_dfs_v1":
@@ -2309,6 +2398,11 @@ class BackwardSlicer:
                 self.stats["termination_reason"] = "identity_ambiguous"
             elif self.stats["undetermined_nodes"]:
                 self.stats["termination_reason"] = "unknown_value_frontier"
+        self._record_search_event(
+            "termination",
+            reason=self.stats["termination_reason"],
+            frontier_remaining=len(self.stats.get("frontier_ids", ())),
+        )
         nodes_with_incoming = {edge.dst_node_id for edge in self.edges}
         for node in self.nodes.values():
             if node.id not in nodes_with_incoming and not node.is_endpoint:
@@ -2322,3 +2416,8 @@ class BackwardSlicer:
         if callable(cache_stats):
             result.update(cache_stats())
         return result
+
+    def get_search_trace(self) -> List[Dict[str, Any]]:
+        """Return a detached copy of the observed search event stream."""
+
+        return [dict(row) for row in self.search_trace]

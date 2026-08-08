@@ -29,31 +29,26 @@ def build_source_ranking(
     """Project graph evidence after graph construction; no gold input is accepted."""
 
     candidates: dict[tuple[str, int], dict[str, Any]] = {}
+    for locator in elaboration.get("source_locators", []):
+        _merge(
+            candidates,
+            locator,
+            score=0.0,
+            instance="",
+            evidence_ids=(),
+            source_authority="authoritative",
+            allow_new=True,
+        )
+
     object_locators: dict[str, list[Mapping[str, Any]]] = {}
     for obj in elaboration.get("objects", []):
         locator = obj.get("source_locator")
         if not isinstance(locator, Mapping):
             continue
         object_locators.setdefault(str(obj.get("name", "")), []).append(locator)
-        _merge(candidates, locator, score=0.0, instance="", evidence_ids=())
-
-    # Freeze a method-independent source candidate universe before scoring.
-    root = Path(source_root)
-    for locator in elaboration.get("source_locators", []):
-        path = str(locator.get("path", ""))
-        source = root / path
-        if not source.is_file():
-            continue
-        for number, text in enumerate(source.read_text(encoding="utf-8").splitlines(), 1):
-            stripped = text.strip()
-            if stripped and not stripped.startswith("//") and stripped not in {"{", "}"}:
-                _merge(
-                    candidates,
-                    {"path": path, "line": number, "column": 1},
-                    score=0.0,
-                    instance="",
-                    evidence_ids=(),
-                )
+    # The method-independent universe is the set of executable Chisel
+    # statements retained by elaboration, never a scan of arbitrary source lines.
+    _ = source_root
 
     nodes = {
         str(row["node_id"]): row
@@ -72,6 +67,7 @@ def build_source_ranking(
                 instance=instance,
                 evidence_ids=(node_id,),
                 semantic_role="state" if not node.get("is_slice_leaf") else "data",
+                source_authority="authoritative",
             )
 
     for edge in graph.get("edges", []):
@@ -111,6 +107,7 @@ def build_source_ranking(
                 instance=instance,
                 evidence_ids=evidence_ids,
                 semantic_role=role,
+                source_authority="authoritative",
             )
 
     for semantic in graph.get("semantic_nodes", []):
@@ -165,30 +162,44 @@ def build_source_ranking(
         row["evidence_group_ids"] = [item["evidence_group_id"] for item in groups]
         row["semantic_roles"] = sorted(role_best)
         row["best_path_ids"] = []
+        row["positive_authoritative_evidence"] = bool(
+            row["score"] > 0.0 and row["authoritative_evidence_ids"]
+        )
 
     rows = sorted(
         candidates.values(),
         key=lambda row: (
             -row["score"],
-            -len(row["evidence_node_ids"]),
-            row["file"],
-            row["line"],
-            row["column"],
+            -len(row["authoritative_evidence_ids"]),
+            row["statement_id"],
         ),
     )
-    previous = None
-    rank = 0
-    for index, row in enumerate(rows, 1):
-        key = (row["score"], len(row["evidence_node_ids"]))
-        if key != previous:
-            rank = index
-            previous = key
-        row["rank"] = rank
+    for position, row in enumerate(rows, 1):
+        row["position"] = position
+    for start in range(len(rows)):
+        if start and rows[start - 1]["score"] == rows[start]["score"]:
+            continue
+        stop = start
+        while stop + 1 < len(rows) and rows[stop + 1]["score"] == rows[start]["score"]:
+            stop += 1
+        average_rank = (start + 1 + stop + 1) / 2
+        for index in range(start, stop + 1):
+            rows[index]["rank"] = average_rank
+            rows[index]["tie_size"] = stop - start + 1
+
+    ambiguous_projection = any(
+        item.get("type") == "source_provenance_hint"
+        and item.get("status") == "ambiguous"
+        for item in graph.get("semantic_nodes", [])
+    )
+    complete_source_projection = bool(rows) and not ambiguous_projection
     return {
-        "schema_version": "chiselcause_source_ranking.v1",
+        "schema_version": "chiselcause_source_ranking.v2",
         "case_id": case_id,
         "method": method,
-        "status": "complete" if any(row["evidence_node_ids"] for row in rows) else "rtl_only",
+        "status": "complete" if complete_source_projection else "incomplete",
+        "complete_graph": graph.get("status") == "complete",
+        "complete_source_projection": complete_source_projection,
         "graph_id": graph.get("graph_id"),
         "policy_id": (graph.get("search_summary") or {}).get("policy_id"),
         "source_projection_status": (
@@ -204,9 +215,16 @@ def build_source_ranking(
         ),
         "ordering": rows,
         "candidates": rows,
+        "statement_candidate_count": len(rows),
+        "authoritative_candidate_count": sum(
+            row["source_authority"] == "authoritative" for row in rows
+        ),
+        "positive_authoritative_candidate_count": sum(
+            row["positive_authoritative_evidence"] for row in rows
+        ),
         "coverage_frontiers": coverage_frontiers,
         "trigger_candidates": trigger_candidates,
-        "tie_rule": "score_then_evidence_count_then_source_location",
+        "tie_rule": "average_rank_by_score; position_by_authoritative_evidence_then_statement_id",
         "ranking_sha256": canonical_sha256(rows),
     }
 
@@ -248,23 +266,43 @@ def _merge(
     evidence_ids: Sequence[str],
     semantic_role: str = "data",
     source_authority: str = "non_authoritative",
+    allow_new: bool = False,
 ) -> None:
     path = str(locator.get("path", ""))
     line = int(locator.get("line", 0) or 0)
+    column = _column(locator.get("column", 1))
     if not path.endswith(".scala") or line <= 0:
         return
     key = (path, line)
+    if key not in candidates and not allow_new:
+        return
+    statement_id = stable_id(
+        "vcs_", {"path": path, "line": line}, length=24
+    )
     row = candidates.setdefault(
         key,
         {
             "rank": 0,
+            "position": 0,
+            "tie_size": 0,
+            "statement_id": statement_id,
             "score": 0.0,
             "instance": instance,
             "file": path,
             "line": line,
-            "column": _column(locator.get("column", 1)),
+            "column": column,
             "evidence_node_ids": [],
+            "authoritative_evidence_ids": [],
             "source_authority": source_authority,
+            "origin_evidence": [
+                {
+                    "kind": "elaboration_source_locator",
+                    "authority": source_authority,
+                    "path": path,
+                    "line": line,
+                    "column": column,
+                }
+            ],
             "_groups": {},
         },
     )
@@ -295,5 +333,9 @@ def _merge(
     row["evidence_node_ids"] = sorted(
         set(row["evidence_node_ids"]) | {item for item in evidence_ids if item}
     )
-    if source_authority < row["source_authority"]:
-        row["source_authority"] = source_authority
+    if source_authority == "authoritative":
+        row["source_authority"] = "authoritative"
+        row["authoritative_evidence_ids"] = sorted(
+            set(row["authoritative_evidence_ids"])
+            | {item for item in evidence_ids if item}
+        )

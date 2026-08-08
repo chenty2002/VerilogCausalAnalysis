@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Any, Dict, Mapping, Optional
 
@@ -348,6 +349,7 @@ class PreparedCausalSession:
                     )
                     projected_paths.add(scope)
         self._closed = False
+        self.search_trace: list[Dict[str, Any]] = []
         self._heuristic_features = build_heuristic_feature_index(
             self._normalized_design
         )
@@ -550,6 +552,7 @@ class PreparedCausalSession:
         )
         nodes, edges = slicer.slice_from_seeds(seeds)
         stats = dict(slicer.get_statistics())
+        raw_search_trace = slicer.get_search_trace()
         ambiguity_by_identity: Dict[tuple[str, int], Dict[str, Any]] = {}
         for row in stats.get("identity_ambiguities") or []:
             key = (str(row["signal"]), int(row["candidate_count"]))
@@ -600,8 +603,9 @@ class PreparedCausalSession:
         )
         identity = _identity(request)
         node_ids: Dict[str, str] = {}
+        slicer_node_ids: Dict[str, str] = {}
         signal_nodes = []
-        for node in raw["nodes"]:
+        for slicer_node, node in zip(nodes.values(), raw["nodes"]):
             new_id = stable_id(
                 "vcn3_",
                 identity,
@@ -611,6 +615,7 @@ class PreparedCausalSession:
                 length=24,
             )
             node_ids[node["node_id"]] = new_id
+            slicer_node_ids[slicer_node.id] = new_id
             signal_nodes.append({**node, "node_id": new_id})
         if self._normalized_design is not None and not projection_members:
             raw_signal_names = {
@@ -624,25 +629,40 @@ class PreparedCausalSession:
                 in raw_signal_names
             ]
         graph_edges = []
-        for edge in raw["edges"]:
+        edge_ids: Dict[str, str] = {}
+        for slicer_edge, edge in zip(edges, raw["edges"]):
             src = node_ids[edge["src_node_id"]]
             dst = node_ids[edge["dst_node_id"]]
+            edge_id = stable_id(
+                "vce3_",
+                identity,
+                src,
+                dst,
+                edge["dependency_type"],
+                edge["rtl_evidence"],
+                length=24,
+            )
+            trace_edge_id = hashlib.md5(
+                f"{slicer_edge.src_node_id}->{slicer_edge.dst_node_id}".encode()
+            ).hexdigest()[:12]
+            edge_ids[trace_edge_id] = edge_id
             graph_edges.append(
                 {
                     **edge,
-                    "edge_id": stable_id(
-                        "vce3_",
-                        identity,
-                        src,
-                        dst,
-                        edge["dependency_type"],
-                        edge["rtl_evidence"],
-                        length=24,
-                    ),
+                    "edge_id": edge_id,
                     "src_node_id": src,
                     "dst_node_id": dst,
                 }
             )
+        self.search_trace = []
+        for raw_event in raw_search_trace:
+            event = dict(raw_event)
+            for field in ("node_id", "parent_node_id", "target_node_id"):
+                if field in event:
+                    event[field] = slicer_node_ids.get(event[field], event[field])
+            if "edge_id" in event:
+                event["edge_id"] = edge_ids.get(event["edge_id"], event["edge_id"])
+            self.search_trace.append(event)
         semantic_nodes = []
         projection_id = None
         if projection is not None:
