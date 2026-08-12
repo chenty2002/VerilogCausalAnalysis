@@ -25,7 +25,7 @@ from enum import Enum
 from hdlConvertor import HdlConvertor
 from hdlConvertorAst.language import Language
 from hdlConvertorAst.hdlAst import (
-    HdlContext, HdlModuleDef, HdlModuleDec, HdlIdDef, HdlDirection,
+    HdlModuleDef, HdlIdDef, HdlDirection,
     HdlStmProcess, HdlStmAssign, HdlStmIf, HdlStmCase, HdlStmBlock,
     HdlOp, HdlOpType, HdlValueInt, HdlValueId, HdlCompInst
 )
@@ -92,8 +92,6 @@ class StatementEvidence:
             (
                 module_name,
                 target_qualified or target,
-                str(line_start),
-                str(line_end),
                 expression,
                 condition,
                 code_snippet,
@@ -508,6 +506,46 @@ class VerilogParser:
         if end - start > max_lines:
             end = start + max_lines
         return '\n'.join(lines[start:end])
+
+    def _port_binding_position(
+        self,
+        module: ModuleInfo,
+        child_module: str,
+        instance_name: str,
+        port_name: str,
+    ) -> Tuple[int, int]:
+        content = self.file_contents[module.file_path]
+        start = sum(
+            len(line) + 1
+            for line in self.file_lines[module.file_path][
+                : max(0, module.line_start - 1)
+            ]
+        )
+        stop = sum(
+            len(line) + 1
+            for line in self.file_lines[module.file_path][
+                : module.line_end
+            ]
+        )
+        instance = re.search(
+            rf"\b{re.escape(child_module)}\s+{re.escape(instance_name)}\s*\(",
+            content[start:stop],
+        )
+        if instance is None:
+            return 0, 0
+        end = content.find(";", start + instance.end(), stop)
+        if end < 0:
+            return 0, 0
+        binding = re.search(
+            rf"\.\s*{re.escape(port_name)}\s*\(",
+            content[start + instance.start() : end],
+        )
+        if binding is None:
+            return 0, 0
+        line = content.count(
+            "\n", 0, start + instance.start() + binding.start()
+        ) + 1
+        return line, line
     
     def _get_width_from_type(self, type_node) -> int:
         """Extract bit width from type node."""
@@ -633,9 +671,7 @@ class VerilogParser:
             target=target,
             target_qualified=target_qualified,
         )
-        statement = self._statement_evidence.setdefault(
-            statement.statement_id, statement
-        )
+        statement = self._intern_statement(statement)
         return Dependency(
             source=source,
             target=target,
@@ -644,6 +680,15 @@ class VerilogParser:
             target_qualified=target_qualified,
             statement=statement,
         )
+
+    def _intern_statement(
+        self, statement: StatementEvidence
+    ) -> StatementEvidence:
+        existing = self._statement_evidence.get(statement.statement_id)
+        if existing is not None and existing != statement:
+            raise ValueError("duplicate stable statement identity")
+        self._statement_evidence[statement.statement_id] = statement
+        return statement
 
     def _add_dependency(self, module: ModuleInfo, dep: Dependency) -> None:
         """Add a dependency to module-local and global registries."""
@@ -807,6 +852,9 @@ class VerilogParser:
                 target=target,
                 target_qualified=self._qualify_signal(module, target),
             )
+            assignment_statement = self._intern_statement(
+                assignment_statement
+            )
             module.assignment_records.append(
                 AssignmentRecord(
                     target,
@@ -873,6 +921,9 @@ class VerilogParser:
                     module_name=module.name,
                     target=target,
                     target_qualified=self._qualify_signal(module, target),
+                )
+                assignment_statement = self._intern_statement(
+                    assignment_statement
                 )
                 module.assignment_records.append(
                     AssignmentRecord(
@@ -1117,22 +1168,48 @@ class VerilogParser:
                         - module.constants
                     )
                     expression = self._expr_to_string(body_obj.value)
+                    statement = StatementEvidence.create(
+                        expression=expression,
+                        file_path=file_path,
+                        line_start=sig_line,
+                        line_end=sig_line,
+                        code_snippet=self._get_code_snippet(
+                            file_path, sig_line, sig_line
+                        ),
+                        module_name=module.name,
+                        target=sig_name,
+                        target_qualified=self._qualify_signal(
+                            module, sig_name
+                        ),
+                    )
+                    statement = self._intern_statement(statement)
+                    module.assignment_records.append(
+                        AssignmentRecord(
+                            sig_name,
+                            expression,
+                            "",
+                            False,
+                            statement.statement_id,
+                            file_path,
+                            sig_line,
+                            sig_line,
+                        )
+                    )
                     for source in sorted(sources):
                         if source != sig_name:
                             self._add_dependency(
                                 module,
-                                self._make_dependency(
-                                    module=module,
+                                Dependency(
                                     source=source,
                                     target=sig_name,
                                     dep_type=DependencyType.COMBINATIONAL,
-                                    expression=expression,
-                                    file_path=file_path,
-                                    line_start=sig_line,
-                                    line_end=sig_line,
-                                    code_snippet=self._get_code_snippet(
-                                        file_path, sig_line, sig_line
+                                    source_qualified=self._qualify_signal(
+                                        module, source
                                     ),
+                                    target_qualified=(
+                                        statement.target_qualified
+                                    ),
+                                    statement=statement,
                                 ),
                             )
             elif isinstance(body_obj, HdlStmProcess):
@@ -1179,6 +1256,12 @@ class VerilogParser:
                     if not port_name or not connected_signal:
                         continue
                     inst_port = f"{inst_name}.{port_name}"
+                    port_line, port_end = self._port_binding_position(
+                        module,
+                        mod_name,
+                        inst_name,
+                        port_name,
+                    )
                     direction = self._get_port_direction(
                         mod_name, port_name
                     )
@@ -1223,10 +1306,12 @@ class VerilogParser:
                                     f".{port_name}({connected_signal})"
                                 ),
                                 file_path=file_path,
-                                line_start=inst_line,
-                                line_end=inst_line,
+                                line_start=port_line or inst_line,
+                                line_end=port_end or inst_line,
                                 code_snippet=self._get_code_snippet(
-                                    file_path, inst_line, inst_line
+                                    file_path,
+                                    port_line or inst_line,
+                                    port_end or inst_line,
                                 ),
                             ),
                         )

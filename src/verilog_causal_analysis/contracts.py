@@ -1,4 +1,4 @@
-"""Typed opt-in request contract for the C0-C6 Chisel semantic profile."""
+"""Typed opt-in request contracts for supported semantic profiles."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from .local_search import (
 REQUEST_SCHEMA = "verilog_causal_request"
 GRAPH_SCHEMA = "verilog_causal_semantic_graph"
 CHISEL_PROFILE = "chisel-semantic-profile"
+VERILOG_PROFILE = "verilog-semantic-profile"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _C6_FEATURES = frozenset(
     {
@@ -32,6 +33,9 @@ _C6_FEATURES = frozenset(
         "waitfor",
         "source_provenance",
     }
+)
+_VERILOG_FEATURES = frozenset(
+    {"instance_graph", "register_transition", "temporal_interval"}
 )
 
 
@@ -185,29 +189,42 @@ class CausalAnalysisRequest:
             FileArtifact.from_dict(item, where=f"rtl_files[{index}]")
             for index, item in enumerate(rtl_rows)
         )
+        if len({item.artifact_id for item in rtl_files}) != len(rtl_files):
+            raise ContractError("RTL artifact IDs must be unique")
         profile_row = row["semantic_profile"]
         _keys(profile_row, {"name", "version", "features"}, "semantic_profile")
         features = profile_row["features"]
+        profile_name = profile_row["name"]
+        profile_version = profile_row["version"]
+        feature_allowlist = (
+            _C6_FEATURES
+            if (profile_name, profile_version)
+            == ("chisel", CHISEL_PROFILE)
+            else (
+                _VERILOG_FEATURES
+                if (profile_name, profile_version)
+                == ("verilog", VERILOG_PROFILE)
+                else None
+            )
+        )
         if (
-            profile_row["name"] != "chisel"
-            or profile_row["version"] != CHISEL_PROFILE
+            feature_allowlist is None
             or not isinstance(features, list)
             or not features
-            or any(item not in _C6_FEATURES for item in features)
+            or any(item not in feature_allowlist for item in features)
         ):
             raise ContractError(
-                "C0-C6 support only the explicit chisel profile features "
-                f"{sorted(_C6_FEATURES)}"
+                "semantic profile or feature is unsupported"
             )
         canonical_features = tuple(sorted(set(features)))
         if "instance_graph" not in canonical_features:
             raise ContractError("C1 requires feature instance_graph")
-        if (
+        if profile_name == "chisel" and (
             "handshake" in canonical_features
             and "aggregate" not in canonical_features
         ):
             raise ContractError("handshake requires feature aggregate")
-        if "pipeline" in canonical_features and not {
+        if profile_name == "chisel" and "pipeline" in canonical_features and not {
             "aggregate",
             "register_transition",
         } <= set(canonical_features):
@@ -221,7 +238,7 @@ class CausalAnalysisRequest:
             raise ContractError(
                 "temporal_interval requires register_transition"
             )
-        if "waitfor" in canonical_features and not {
+        if profile_name == "chisel" and "waitfor" in canonical_features and not {
             "aggregate",
             "handshake",
             "pipeline",
@@ -233,7 +250,7 @@ class CausalAnalysisRequest:
                 "register_transition, and temporal_interval"
             )
         profile = SemanticProfile(
-            "chisel", CHISEL_PROFILE, canonical_features
+            profile_name, profile_version, canonical_features
         )
         _keys(row["clock"], {"signal", "edge"}, "clock")
         if row["clock"]["edge"] != "rising":
@@ -292,6 +309,12 @@ class CausalAnalysisRequest:
             )
             for index, item in enumerate(semantic_rows)
         )
+        if profile.name == "verilog" and (
+            semantic_inputs or endpoint.projection_mode != "none"
+        ):
+            raise ContractError(
+                "verilog profile rejects Chisel semantic inputs and endpoint projection"
+            )
         semantic_by_id = {item.artifact_id: item for item in semantic_inputs}
         if len(semantic_by_id) != len(semantic_inputs):
             raise ContractError("semantic input IDs must be unique")
@@ -513,7 +536,10 @@ def validate_graph(value: Mapping[str, Any]) -> Dict[str, Any]:
     )
     for field in ("request_sha256", "rtl_set_sha256", "trace_sha256"):
         _hash(identity[field], f"semantic_graph.identity.{field}")
-    if identity["profile_version"] != CHISEL_PROFILE:
+    if identity["profile_version"] not in {
+        CHISEL_PROFILE,
+        VERILOG_PROFILE,
+    }:
         raise ContractError("semantic graph profile version is invalid")
     for field in (
         "signal_nodes",

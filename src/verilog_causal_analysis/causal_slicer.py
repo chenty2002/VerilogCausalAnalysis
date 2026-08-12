@@ -1841,6 +1841,7 @@ class BackwardSlicer:
                 contribution_type=contribution_type,
                 contribution_score=candidate.contribution_score,
                 evidence={
+                    "statement_id": dep.statement_id,
                     "file": dep.file_path,
                     "lines": [dep.line_start, dep.line_end],
                     "code_snippet": dep.code_snippet,

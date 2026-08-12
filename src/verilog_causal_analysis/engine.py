@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
 from .causal_slicer import BackwardSlicer
@@ -20,8 +21,9 @@ from .chisel_protocol_semantics import (
 from .structural_contract import make_structural_request
 from .contracts import (
     CausalAnalysisRequest,
-    CHISEL_PROFILE,
+    ContractError,
     GRAPH_SCHEMA,
+    VERILOG_PROFILE,
 )
 from .endpoint_projection import (
     EndpointProjectionError,
@@ -29,7 +31,13 @@ from .endpoint_projection import (
     load_assertion_projection,
 )
 from .structural_engine import PreparedCausalAnalysis, _convert_graph, _diagnostic
-from .identity import ANALYZER_REVISION, stable_id, stable_set_sha256
+from .identity import (
+    ANALYZER_REVISION,
+    canonical_sha256,
+    sha256_file,
+    stable_id,
+    stable_set_sha256,
+)
 from .local_search import SearchSeed, make_search_summary
 from .instance_graph import InstanceGraph, InstanceGraphError
 from .temporal_semantics import build_c4_temporal_layer, c4_enabled
@@ -46,6 +54,7 @@ from .provenance import (
     c6_enabled,
     load_source_annotations,
 )
+from .verilog_parser import DependencyType, VerilogParser
 
 _MAX_RAW_SLICE_DEPTH = 256
 
@@ -151,7 +160,7 @@ def _identity(request: CausalAnalysisRequest) -> Dict[str, Any]:
                 )
             )
         ),
-        "profile_version": CHISEL_PROFILE,
+        "profile_version": request.semantic_profile.version,
     }
 
 
@@ -602,13 +611,18 @@ class PreparedCausalSession:
         for slicer_edge, edge in zip(edges, raw["edges"]):
             src = node_ids[edge["src_node_id"]]
             dst = node_ids[edge["dst_node_id"]]
+            rtl_evidence = dict(edge["rtl_evidence"])
+            if request.semantic_profile.version == VERILOG_PROFILE:
+                rtl_evidence["statement_id"] = slicer_edge.evidence.get(
+                    "statement_id"
+                )
             edge_id = stable_id(
                 "vce3_",
                 identity,
                 src,
                 dst,
                 edge["dependency_type"],
-                edge["rtl_evidence"],
+                rtl_evidence,
                 length=24,
             )
             trace_edge_id = hashlib.md5(
@@ -621,6 +635,7 @@ class PreparedCausalSession:
                     "edge_id": edge_id,
                     "src_node_id": src,
                     "dst_node_id": dst,
+                    "rtl_evidence": rtl_evidence,
                 }
             )
         self.search_trace = []
@@ -1274,6 +1289,80 @@ def prepare_causal_session(
     top_module: Optional[str] = None,
 ) -> PreparedCausalSession:
     return PreparedCausalSession(request, top_module=top_module)
+
+
+def build_rtl_candidates(
+    request: CausalAnalysisRequest | Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Build the exact executable statement universe for native Verilog RTL."""
+
+    if not isinstance(request, CausalAnalysisRequest):
+        request = CausalAnalysisRequest.from_dict(request)
+    if request.semantic_profile.version != VERILOG_PROFILE:
+        raise ContractError("RTL candidates require the verilog profile")
+
+    artifact_by_path = {}
+    for artifact in request.rtl_files:
+        if sha256_file(artifact.path) != (artifact.sha256, artifact.bytes):
+            raise ContractError(
+                f"RTL bytes or SHA-256 differ for {artifact.artifact_id}"
+            )
+        artifact_by_path[str(Path(artifact.path).resolve())] = artifact.artifact_id
+
+    parser = VerilogParser(strict=True)
+    parser.parse_files_strict(
+        item.path for item in sorted(request.rtl_files, key=lambda row: row.artifact_id)
+    )
+    records = {
+        row.statement_id: row.is_sequential
+        for module in parser.modules.values()
+        for row in module.assignment_records
+    }
+    dependency_types: Dict[str, set[DependencyType]] = {}
+    for dependency in parser.all_dependencies:
+        dependency_types.setdefault(dependency.statement_id, set()).add(
+            dependency.dep_type
+        )
+
+    candidates = []
+    for statement_id, statement in sorted(parser._statement_evidence.items()):
+        types = dependency_types.get(statement_id, set())
+        if statement_id not in records and types == {DependencyType.ASSERTION}:
+            continue
+        try:
+            artifact_id = artifact_by_path[str(Path(statement.file_path).resolve())]
+        except KeyError as error:
+            raise ContractError("statement references an unbound RTL artifact") from error
+        if statement.line_start <= 0 or not statement.code_snippet:
+            raise ContractError(
+                f"statement {statement_id} lacks exact source identity"
+            )
+        kind = (
+            "port_binding"
+            if types & {DependencyType.PORT_INPUT, DependencyType.PORT_OUTPUT}
+            else "register_update"
+            if records.get(statement_id)
+            else "assignment"
+        )
+        candidates.append(
+            {
+                "artifact_id": artifact_id,
+                "statement_id": statement_id,
+                "line_start": statement.line_start,
+                "line_end": statement.line_end,
+                "statement_kind": kind,
+                "executable": True,
+                "snippet_sha256": canonical_sha256(statement.code_snippet),
+            }
+        )
+    return {
+        "schema_version": "rtl_candidate_universe.v1",
+        "rtl_set_sha256": _identity(request)["rtl_set_sha256"],
+        "candidates": sorted(
+            candidates,
+            key=lambda row: (row["artifact_id"], row["statement_id"]),
+        ),
+    }
 
 
 def _classify_internal_waveform_frontiers(

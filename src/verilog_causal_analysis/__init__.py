@@ -2,6 +2,7 @@
 
 from .contracts import (
     CHISEL_PROFILE,
+    VERILOG_PROFILE,
     GRAPH_SCHEMA,
     REQUEST_SCHEMA,
     CausalAnalysisRequest,
@@ -138,6 +139,13 @@ def build_causal_graph(request, *, top_module=None):
     return build(request, top_module=top_module)
 
 
+def build_rtl_candidates(request):
+    """Build the native Verilog executable statement universe."""
+    from .engine import build_rtl_candidates as build
+
+    return build(request)
+
+
 def prepare_causal_session(request, *, top_module=None):
     """Prepare shared state for Chisel-aware causal queries."""
     from .engine import prepare_causal_session as prepare
@@ -150,6 +158,7 @@ __all__ = [
     "ASSERTION_PROJECTION_SCHEMA",
     "AssertionEndpointProjection",
     "CHISEL_PROFILE",
+    "VERILOG_PROFILE",
     "CONTRIBUTION_SCHEMA",
     "CausalAnalysisRequest",
     "ContributionContractError",
@@ -203,6 +212,7 @@ __all__ = [
     "WAITFOR_FEATURE",
     "WaitForError",
     "build_causal_graph",
+    "build_rtl_candidates",
     "build_structural_graph",
     "build_source_ranking",
     "build_heuristic_feature_index",
