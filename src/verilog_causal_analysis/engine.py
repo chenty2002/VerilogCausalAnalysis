@@ -558,6 +558,9 @@ class PreparedCausalSession:
             stats,
             diagnostics,
             self._prepared.artifact_by_path,
+            include_statement_id=(
+                request.semantic_profile.version == VERILOG_PROFILE
+            ),
         )
         raw["search_summary"] = make_search_summary(
             request.search_policy,
@@ -612,10 +615,6 @@ class PreparedCausalSession:
             src = node_ids[edge["src_node_id"]]
             dst = node_ids[edge["dst_node_id"]]
             rtl_evidence = dict(edge["rtl_evidence"])
-            if request.semantic_profile.version == VERILOG_PROFILE:
-                rtl_evidence["statement_id"] = slicer_edge.evidence.get(
-                    "statement_id"
-                )
             edge_id = stable_id(
                 "vce3_",
                 identity,

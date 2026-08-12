@@ -118,9 +118,9 @@ def test_native_graph_edges_join_candidates_and_hash_drift_fails(
     rtl = tmp_path / "Top.sv"
     rtl.write_text(
         "module Top(input wire clk, input wire a, output wire y);\n"
-        "  assign y = a;\n"
-        "  wire unused;\n"
-        "  assign unused = ~a;\n"
+        "  wire mid;\n"
+        "  assign mid = a;\n"
+        "  assign y = mid;\n"
         "endmodule\n"
     )
     tb = tmp_path / "tb.sv"
@@ -176,8 +176,19 @@ def test_native_graph_edges_join_candidates_and_hash_drift_fails(
         if row.get("rtl_evidence", {}).get("statement_id")
     ]
     assert mapped
+    candidates_by_id = {
+        (row["artifact_id"], row["statement_id"]): row
+        for row in candidates["candidates"]
+    }
     assert all(
         (row["artifact_id"], row["statement_id"]) in universe for row in mapped
+    )
+    assert all(
+        row["line_start"]
+        == candidates_by_id[(row["artifact_id"], row["statement_id"])][
+            "line_start"
+        ]
+        for row in mapped
     )
     assert graph["identity"]["rtl_set_sha256"] == candidates["rtl_set_sha256"]
 

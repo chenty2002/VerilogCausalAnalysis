@@ -185,6 +185,8 @@ def _convert_graph(
     stats: Mapping[str, Any],
     diagnostics: List[Dict[str, Any]],
     artifact_by_path: Mapping[str, str],
+    *,
+    include_statement_id: bool = False,
 ) -> Dict[str, Any]:
     identity = _graph_identity(request)
     nodes_input = list(structural_nodes)
@@ -257,6 +259,8 @@ def _convert_graph(
                 str(evidence.get("condition") or "")
             ),
         }
+        if include_statement_id:
+            rtl_evidence["statement_id"] = evidence.get("statement_id")
         if artifact_id is None or line_start <= 0:
             diagnostics.append(
                 _diagnostic(
