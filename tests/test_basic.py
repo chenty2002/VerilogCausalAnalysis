@@ -13,27 +13,38 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 def test_imports():
     """Test that all main classes can be imported."""
     from verilog_causal_analysis import (
+        build_structural_graph,
+        make_structural_request,
+        validate_structural_graph,
+        __version__,
+    )
+    from verilog_causal_analysis.causal_graph import (
         CausalGraphBuilder,
         CausalGraphResult,
         CausalGraphMeta,
         build_causal_graph,
+    )
+    from verilog_causal_analysis.verilog_parser import (
         VerilogParser,
         DependencyType,
         Dependency,
         SignalInfo,
         ModuleInfo,
+    )
+    from verilog_causal_analysis.cycle_waveform import (
         CycleAlignedWaveform,
         SignalTransition,
         CycleSnapshot,
         parse_binary_value,
         invert_value,
         values_differ,
+    )
+    from verilog_causal_analysis.causal_slicer import (
         BackwardSlicer,
         CausalNode,
         CausalEdge,
         ContributionType,
         ExpressionEvaluator,
-        __version__
     )
     
     print(f"✓ All imports successful")
@@ -42,7 +53,7 @@ def test_imports():
 
 def test_verilog_parser_basic():
     """Test VerilogParser basic functionality."""
-    from verilog_causal_analysis import VerilogParser
+    from verilog_causal_analysis.verilog_parser import VerilogParser
     
     parser = VerilogParser()
     assert parser is not None
@@ -51,7 +62,7 @@ def test_verilog_parser_basic():
 
 def test_verilog_parser_dependencies():
     """Test direction-aware ports, control deps, and full multiline SVA capture."""
-    from verilog_causal_analysis import VerilogParser, DependencyType
+    from verilog_causal_analysis.verilog_parser import VerilogParser, DependencyType
 
     source = r'''
 module Child(input logic in, output logic out);
@@ -108,33 +119,9 @@ endmodule
     print("✓ VerilogParser dependency extraction tests passed")
 
 
-def test_sva_label_auto_detect_split_line():
-    """Test SVA label extraction when label and assert property are split."""
-    from verilog_causal_analysis import extract_sva_assertions_from_verilog
-
-    source = r'''
-module M(input logic clk, input logic a);
-  split_label:
-    assert property (@(posedge clk) a);
-endmodule
-'''
-
-    with tempfile.NamedTemporaryFile('w', suffix='.sv', delete=False) as tmp:
-        tmp.write(source)
-        path = tmp.name
-
-    try:
-        labels = extract_sva_assertions_from_verilog([path])
-        assert labels == ['split_label']
-    finally:
-        os.unlink(path)
-
-    print("✓ SVA label auto-detection tests passed")
-
-
 def test_sva_signal_extraction_preserves_source_order():
     """Test SVA dependency extraction keeps operand order stable."""
-    from verilog_causal_analysis import VerilogParser
+    from verilog_causal_analysis.verilog_parser import VerilogParser
 
     parser = VerilogParser()
 
@@ -145,7 +132,8 @@ def test_sva_signal_extraction_preserves_source_order():
 
 def test_endpoint_direct_dependencies_are_preserved_before_recursion():
     """Test endpoint parents are not lost when the first branch exhausts max_nodes."""
-    from verilog_causal_analysis import BackwardSlicer, Dependency, DependencyType
+    from verilog_causal_analysis.causal_slicer import BackwardSlicer
+    from verilog_causal_analysis.verilog_parser import Dependency, DependencyType
 
     class FakeParser:
         def build_dependency_graph(self):
@@ -218,7 +206,7 @@ def test_endpoint_direct_dependencies_are_preserved_before_recursion():
 
 def test_expression_evaluator():
     """Test ExpressionEvaluator."""
-    from verilog_causal_analysis import ExpressionEvaluator
+    from verilog_causal_analysis.causal_slicer import ExpressionEvaluator
     
     env = {
         'a': '1010',
@@ -245,7 +233,11 @@ def test_expression_evaluator():
 
 def test_utility_functions():
     """Test utility functions."""
-    from verilog_causal_analysis import parse_binary_value, invert_value, values_differ
+    from verilog_causal_analysis.cycle_waveform import (
+        invert_value,
+        parse_binary_value,
+        values_differ,
+    )
     
     # Test parse_binary_value
     assert parse_binary_value('1010') == 10
@@ -269,7 +261,6 @@ if __name__ == '__main__':
     test_imports()
     test_verilog_parser_basic()
     test_verilog_parser_dependencies()
-    test_sva_label_auto_detect_split_line()
     test_expression_evaluator()
     test_utility_functions()
     

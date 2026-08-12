@@ -308,6 +308,8 @@ class DependencyIndex:
         base_signal: str,
         module_name: Optional[str],
     ) -> bool:
+        if module_name and arc.module_name != module_name:
+            return False
         if clean_signal in {arc.target_clean, arc.target_qualified}:
             return True
         if "." in clean_signal and clean_signal.endswith("." + arc.target_clean):
@@ -384,6 +386,7 @@ class ModuleInfo:
     line_end: int
     ports: Dict[str, SignalInfo] = field(default_factory=dict)
     signals: Dict[str, SignalInfo] = field(default_factory=dict)
+    constants: Set[str] = field(default_factory=set)
     dependencies: List[Dependency] = field(default_factory=list)
     assignment_records: List[AssignmentRecord] = field(default_factory=list)
     submodule_instances: List[Tuple[str, str, int]] = field(default_factory=list)
@@ -779,13 +782,13 @@ class VerilogParser:
                             is_sequential: bool, condition: str = "",
                             condition_sources: Optional[Set[str]] = None):
         """Process an assignment statement and extract dependencies."""
-        condition_sources = condition_sources or set()
+        condition_sources = (condition_sources or set()) - module.constants
         if isinstance(assign, HdlStmAssign):
             target = self._get_signal_name(assign.dst)
             if not target:
                 return
             
-            sources = self._extract_signals_from_expr(assign.src)
+            sources = self._extract_signals_from_expr(assign.src) - module.constants
             expr_str = self._expr_to_string(assign.src)
             
             line_start, line_end = self._get_position(assign)
@@ -840,7 +843,7 @@ class VerilogParser:
                         source=source,
                         target=target,
                         dep_type=dep_type,
-                        expression=condition or expr_str,
+                        expression=expr_str,
                         file_path=file_path,
                         line_start=line_start,
                         line_end=line_end,
@@ -856,7 +859,10 @@ class VerilogParser:
                 if not target:
                     return
                 
-                sources = self._extract_signals_from_expr(assign.ops[1])
+                sources = (
+                    self._extract_signals_from_expr(assign.ops[1])
+                    - module.constants
+                )
                 expr_str = self._expr_to_string(assign.ops[1])
                 
                 dep_type = DependencyType.SEQUENTIAL if is_sequential else DependencyType.COMBINATIONAL
@@ -903,7 +909,7 @@ class VerilogParser:
                             source=source,
                             target=target,
                             dep_type=dep_type,
-                            expression=condition or expr_str,
+                            expression=expr_str,
                             file_path=file_path,
                             line_start=0,
                             line_end=0,
@@ -1044,6 +1050,10 @@ class VerilogParser:
             line_start=line_start,
             line_end=line_end,
         )
+        module.constants.update(
+            str(getattr(param.name, "val", param.name))
+            for param in (getattr(obj.dec, "params", ()) or ())
+        )
         if obj.dec and hasattr(obj.dec, "ports"):
             for port in obj.dec.ports:
                 port_name = (
@@ -1072,8 +1082,15 @@ class VerilogParser:
         file_path: str,
     ) -> None:
         """Extract statements after the complete module registry exists."""
+        module.constants.update(
+            str(getattr(row.name, "val", row.name))
+            for row in obj.objs
+            if isinstance(row, HdlIdDef) and getattr(row, "is_const", False)
+        )
         for body_obj in obj.objs:
             if isinstance(body_obj, HdlIdDef):
+                if getattr(body_obj, "is_const", False):
+                    continue
                 sig_name = (
                     body_obj.name.val
                     if hasattr(body_obj.name, "val")
@@ -1095,7 +1112,10 @@ class VerilogParser:
                 )
                 module.signals[sig_name] = signal
                 if body_obj.value is not None:
-                    sources = self._extract_signals_from_expr(body_obj.value)
+                    sources = (
+                        self._extract_signals_from_expr(body_obj.value)
+                        - module.constants
+                    )
                     expression = self._expr_to_string(body_obj.value)
                     for source in sorted(sources):
                         if source != sig_name:

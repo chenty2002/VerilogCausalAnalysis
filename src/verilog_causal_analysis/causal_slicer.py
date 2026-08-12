@@ -33,7 +33,6 @@ from .local_search import (
     fanout_penalty,
     frontier_priority,
     path_support,
-    score_features,
 )
 
 
@@ -1272,7 +1271,20 @@ class BackwardSlicer:
                 environment[source_dep.source] = value
                 source_values[source_dep.source] = value
 
-        compiled = self._get_compiled_expression(dep.expression)
+        expression = dep.expression
+        if dep.dep_type == DependencyType.SEQUENTIAL and dep.condition:
+            target_cycle_value, _resolved = self._resolve_signal_value(
+                dep.target,
+                max(0, target_cycle - 1),
+                target_hierarchy,
+                prefer_hierarchy=True,
+            )
+            if target_cycle_value is not None:
+                environment[dep.target] = target_cycle_value
+                expression = (
+                    f"({dep.condition}) ? ({dep.expression}) : ({dep.target})"
+                )
+        compiled = self._get_compiled_expression(expression)
         original_result = (
             compiled.evaluate(environment) if environment else None
         )
@@ -1548,10 +1560,7 @@ class BackwardSlicer:
         if parent_cycle < 0:
             return None
         source_base = self._extract_base_signal_name(dep.source)
-        target_base = self._extract_base_signal_name(node.signal)
-        if source_base == target_base or source_base in _IGNORED_SIGNALS:
-            return None
-        if dep.source == node.signal:
+        if source_base in _IGNORED_SIGNALS:
             return None
         full_source = (
             f"{parent_hierarchy}.{dep.source}"
@@ -1560,11 +1569,7 @@ class BackwardSlicer:
             else dep.source
         )
         clean_node_signal = re.sub(r'\s*\[\d+:\d+\]$', '', node.signal)
-        full_source_base = full_source.rsplit('.', 1)[-1]
-        if (
-            (full_source == clean_node_signal or full_source_base == target_base)
-            and dep.dep_type == DependencyType.COMBINATIONAL
-        ):
+        if full_source == clean_node_signal:
             return None
         return parent_cycle
 
@@ -1586,7 +1591,7 @@ class BackwardSlicer:
             for parent_cycle in [self._expandable_parent_cycle(node, dep, parent_hierarchy)]
             if parent_cycle is not None
         ]
-        if self.search_policy is not None and self.search_policy.policy_id != "legacy_dfs_v1":
+        if self.search_policy is not None:
             candidates.sort(
                 key=lambda row: (
                     row[0].source,
@@ -1714,19 +1719,7 @@ class BackwardSlicer:
             values["C_ctrl"] = 0.85 if dep.dep_type == DependencyType.SEQUENTIAL else 0.7 if dep.condition else 0.3
             availability["C_ctrl"] = "available"
         semantic = None
-        if self.search_policy.policy_id == "chisel_hybrid_best_first_v1":
-            semantic = (
-                self.heuristic_context.get(parent_node.signal)
-                if self.heuristic_context is not None
-                else None
-            )
-            if semantic is None:
-                availability["C_sem"] = "not_available"
-            else:
-                values["C_sem"] = semantic.semantic_score
-                availability["C_sem"] = "available"
-        else:
-            availability["C_sem"] = "not_applicable"
+        availability["C_sem"] = "not_applicable"
         if availability["C_structural"] == "not_available":
             availability["C_structural"] = "not_applicable"
 
@@ -1771,52 +1764,16 @@ class BackwardSlicer:
             return None
         self.stats["candidate_evaluations"] += 1
 
-        if self.search_policy is None or self.search_policy.policy_id in {
-            "legacy_dfs_v1", "legacy_scalar_best_first_v1"
-        }:
-            interventions_before = self.stats["intervention_evaluations"]
-            is_causal, score, examples = self._evaluate_counterfactual(
-                node.signal, node.cycle, parent_node.signal, parent_cycle, dep, statement_dependencies
-            )
-            if not is_causal and '|->' in dep.expression:
-                trigger_cycle = self.stats.get("sva_trigger_cycle")
-                if trigger_cycle is not None and node.cycle == trigger_cycle:
-                    is_causal, score = True, 0.85
-                    examples = [{
-                        "type": "sva_antecedent", "trigger_cycle": trigger_cycle,
-                        "expression": dep.expression, "signal": parent_node.signal,
-                        "value": parent_node.value,
-                    }]
-            weak = not is_causal
-            if weak and not node.rtl_context_missing:
-                score = 0.3
-                examples = [{"type": "structural", "reason": "RTL dependency exists but counterfactual not conclusive"}]
-            envelope = adapt_legacy_contribution(
-                legacy_method=self._legacy_method(examples, is_causal),
-                legacy_score=score,
-                expression_evaluations=1,
-                intervention_evaluations=(
-                    self.stats["intervention_evaluations"] - interventions_before
-                ),
-                change_examples=examples,
-            )
-            if self.search_policy is not None and self.search_policy.policy_id == "legacy_scalar_best_first_v1":
-                feature_row = self._extract_score_features(parent_node, dep, envelope)
-                local_score = score_features(self.search_policy, feature_row).local_score
-            else:
-                feature_row = None
-                local_score = score
-        else:
-            raw_evidence = self._evaluate_typed_contribution(
-                node, parent_node, dep, statement_dependencies
-            )
-            is_causal = raw_evidence.status == "supported"
-            weak = not is_causal
-            envelope = raw_evidence
-            score = raw_evidence.score
-            examples = []
-            feature_row = self._extract_score_features(parent_node, dep, envelope)
-            local_score = score_features(self.search_policy, feature_row).local_score
+        raw_evidence = self._evaluate_typed_contribution(
+            node, parent_node, dep, statement_dependencies
+        )
+        is_causal = raw_evidence.status == "supported"
+        weak = not is_causal
+        envelope = raw_evidence
+        score = raw_evidence.score
+        examples = []
+        feature_row = None
+        local_score = score
         result = CandidateExpansion(
             dep, parent_cycle, parent_node, parent_is_new, is_causal, weak,
             score, envelope, examples, local_score, feature_row,
@@ -1835,15 +1792,14 @@ class BackwardSlicer:
     def _admit_evaluated_candidates(
         self, node: CausalNode, evaluated: List[CandidateExpansion]
     ) -> List[CandidateExpansion]:
-        if self.search_policy is not None and self.search_policy.policy_id != "legacy_dfs_v1":
-            evaluated.sort(
-                key=lambda row: (
-                    row.weak_candidate,
-                    -row.local_score,
-                    row.parent_node.id,
-                    row.dep.source,
-                )
+        evaluated.sort(
+            key=lambda row: (
+                row.weak_candidate,
+                -row.contribution_score,
+                row.parent_node.id,
+                row.dep.source,
             )
+        )
         admitted: List[CandidateExpansion] = []
         weak_for_target = 0
         for candidate in evaluated:
@@ -1942,12 +1898,26 @@ class BackwardSlicer:
             return []
         evaluated: List[CandidateExpansion] = []
         for dep, parent_cycle in candidates:
+            statement_dependencies = statement_groups[
+                self._statement_key(dep, node.signal, node.cycle)
+            ]
+            if dep.condition and dep.dep_type == DependencyType.COMBINATIONAL:
+                context = self._get_statement_evaluation(
+                    node.signal, node.cycle, dep, statement_dependencies
+                )
+                condition = self._get_compiled_expression(dep.condition).evaluate(
+                    context.environment
+                )
+                if condition is not None and not ExpressionEvaluator(
+                    context.environment
+                )._is_true(condition):
+                    continue
             if self.stats["candidate_evaluations"] >= self.candidate_evaluation_budget:
                 self.stats["candidate_evaluation_budget_reached"] = True
                 break
             result = self._evaluate_candidate(
                 node, depth, parent_hierarchy, dep, parent_cycle,
-                statement_groups[self._statement_key(dep, node.signal, node.cycle)],
+                statement_dependencies,
             )
             if result is not None:
                 evaluated.append(result)
@@ -1966,8 +1936,7 @@ class BackwardSlicer:
         for candidate in self._expand_node(node, depth):
             if self.stats["intervention_evaluation_budget_reached"]:
                 break
-            if not any(char in candidate.parent_node.value.lower() for char in ("x", "z")):
-                self._slice_node(candidate.parent_node, depth + 1)
+            self._slice_node(candidate.parent_node, depth + 1)
 
     def _run_frontier(self, seeds: List[Tuple[SearchSeed, CausalNode]]) -> None:
         scheduler = FrontierScheduler(self.search_policy)
@@ -2299,22 +2268,7 @@ class BackwardSlicer:
                         self._slice_node(trigger_node, trigger_node.depth)
         else:
             # No time window - just do normal backward slicing from endpoint
-            if self.search_policy is not None and self.search_policy.policy_id != "legacy_dfs_v1":
-                self._run_frontier([
-                    (
-                        SearchSeed(
-                            seed_id="endpoint",
-                            signal=endpoint_signal,
-                            cycle=original_endpoint_cycle,
-                            seed_kind="exact_endpoint",
-                            seed_prior=1.0,
-                            seed_rank=0,
-                        ),
-                        endpoint_node,
-                    )
-                ])
-            else:
-                self._slice_node(endpoint_node, 0)
+            self._slice_node(endpoint_node, 0)
         
         # Mark leaf nodes as roots
         nodes_with_incoming = set(e.dst_node_id for e in self.edges)
@@ -2334,8 +2288,6 @@ class BackwardSlicer:
                 self.stats["termination_reason"] = "max_signal_depth"
             elif self.stats.get("identity_ambiguities"):
                 self.stats["termination_reason"] = "identity_ambiguous"
-            elif self.stats["undetermined_nodes"]:
-                self.stats["termination_reason"] = "unknown_value_frontier"
         
         return self.nodes, self.edges
 
@@ -2379,25 +2331,20 @@ class BackwardSlicer:
             )
         if not prepared:
             return {}, []
-        if self.search_policy is not None and self.search_policy.policy_id != "legacy_dfs_v1":
-            self._run_frontier(prepared)
-        else:
-            for _seed, node in prepared:
-                self._slice_node(node, 0)
-            if self.stats["intervention_evaluation_budget_reached"]:
-                self.stats["termination_reason"] = "max_intervention_evaluations"
-            elif self.stats["candidate_evaluation_budget_reached"]:
-                self.stats["termination_reason"] = "max_candidate_evaluations"
-            elif self.stats["expanded_node_budget_reached"]:
-                self.stats["termination_reason"] = "max_expanded_nodes"
-            elif self.stats["max_nodes_reached"]:
-                self.stats["termination_reason"] = "max_signal_nodes"
-            elif self.stats["max_depth_reached"]:
-                self.stats["termination_reason"] = "max_signal_depth"
-            elif self.stats.get("identity_ambiguities"):
-                self.stats["termination_reason"] = "identity_ambiguous"
-            elif self.stats["undetermined_nodes"]:
-                self.stats["termination_reason"] = "unknown_value_frontier"
+        for _seed, node in prepared:
+            self._slice_node(node, 0)
+        if self.stats["intervention_evaluation_budget_reached"]:
+            self.stats["termination_reason"] = "max_intervention_evaluations"
+        elif self.stats["candidate_evaluation_budget_reached"]:
+            self.stats["termination_reason"] = "max_candidate_evaluations"
+        elif self.stats["expanded_node_budget_reached"]:
+            self.stats["termination_reason"] = "max_expanded_nodes"
+        elif self.stats["max_nodes_reached"]:
+            self.stats["termination_reason"] = "max_signal_nodes"
+        elif self.stats["max_depth_reached"]:
+            self.stats["termination_reason"] = "max_signal_depth"
+        elif self.stats.get("identity_ambiguities"):
+            self.stats["termination_reason"] = "identity_ambiguous"
         self._record_search_event(
             "termination",
             reason=self.stats["termination_reason"],

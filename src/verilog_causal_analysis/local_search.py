@@ -18,12 +18,8 @@ from .identity import canonical_sha256
 
 FEATURE_SCHEMA = "vca_search_features_v1"
 SEARCH_SUMMARY_SCHEMA = "vca_search_summary_v1"
-POLICY_IDS = (
-    "legacy_dfs_v1",
-    "legacy_scalar_best_first_v1",
-    "edge_best_first_v1",
-    "chisel_hybrid_best_first_v1",
-)
+D2_POLICY_ID = "d2_backward_v1"
+POLICY_IDS = (D2_POLICY_ID,)
 POSITIVE_FEATURES = (
     "C_cf",
     "C_obs",
@@ -184,30 +180,19 @@ def _feature_value_tables() -> Dict[str, Any]:
 
 
 def _policy_payload(policy_id: str) -> Dict[str, Any]:
-    hybrid = policy_id != "legacy_dfs_v1"
-    if policy_id == "chisel_hybrid_best_first_v1":
-        positive = {
-            "C_cf": 0.35,
-            "C_obs": 0.15,
-            "C_time": 0.15,
-            "C_ctrl": 0.15,
-            "C_sem": 0.2,
-            "C_structural": 0.1,
-        }
-    else:
-        positive = {
-            "C_cf": 0.5,
-            "C_obs": 0.2,
-            "C_time": 0.15,
-            "C_ctrl": 0.15,
-            "C_sem": None,
-            "C_structural": 0.1,
-        }
+    positive = {
+        "C_cf": 1.0,
+        "C_obs": None,
+        "C_time": None,
+        "C_ctrl": None,
+        "C_sem": None,
+        "C_structural": None,
+    }
     return {
         "policy_id": policy_id,
         "feature_schema": FEATURE_SCHEMA,
-        "scheduler_kind": "hybrid_best_first" if hybrid else "legacy_lifo_dfs",
-        "exploration_period": 5,
+        "scheduler_kind": "deterministic_backward_dfs",
+        "exploration_period": 0,
         "weak_beam_width": 2,
         "max_support_paths_per_node": 3,
         "max_interventions_per_candidate": 4,
@@ -250,7 +235,7 @@ def _build_registry() -> Mapping[str, SearchPolicy]:
 POLICY_REGISTRY = _build_registry()
 
 
-def policy_identity(policy_id: str) -> SearchPolicyIdentity:
+def policy_identity(policy_id: str = D2_POLICY_ID) -> SearchPolicyIdentity:
     try:
         return POLICY_REGISTRY[policy_id].identity
     except KeyError as error:

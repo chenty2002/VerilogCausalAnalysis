@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Tuple
 
+from .contribution import ContributionContractError, ContributionEvidence
 from .identity import canonical_sha256, contains_absolute_path, stable_id
 from .local_search import (
     LocalSearchContractError,
@@ -453,6 +454,7 @@ def validate_structural_graph(graph: Mapping[str, Any]) -> Dict[str, Any]:
                 "identity_strength",
                 "evidence_strength",
                 "contribution_score",
+                "contribution_evidence",
                 "reason_code",
                 "rtl_evidence",
                 "change_examples",
@@ -470,6 +472,14 @@ def validate_structural_graph(graph: Mapping[str, Any]) -> Dict[str, Any]:
             raise StructuralContractError("edge evidence_strength is invalid")
         if not 0 <= float(edge["contribution_score"]) <= 1:
             raise StructuralContractError("edge contribution_score must be in [0, 1]")
+        try:
+            evidence = ContributionEvidence.from_dict(edge["contribution_evidence"])
+        except ContributionContractError as error:
+            raise StructuralContractError(str(error)) from error
+        if evidence.score != float(edge["contribution_score"]):
+            raise StructuralContractError(
+                "edge contribution_score must match contribution_evidence"
+            )
         _exact_keys(
             edge["rtl_evidence"],
             {

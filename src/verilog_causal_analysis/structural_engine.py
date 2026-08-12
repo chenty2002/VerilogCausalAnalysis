@@ -24,6 +24,7 @@ from .identity import (
     stable_set_sha256,
 )
 from .local_search import make_search_summary
+from .instance_graph import InstanceGraph, InstanceGraphError
 from .verilog_parser import VerilogParser
 
 
@@ -224,6 +225,8 @@ def _convert_graph(
                 _diagnostic(
                     "waveform_value_unknown",
                     f"unknown value for signal {signal} at cycle {cycle}",
+                    severity="warning",
+                    breaks_complete=False,
                 )
             )
 
@@ -292,6 +295,7 @@ def _convert_graph(
                     max(0.0, min(1.0, float(edge.get("contribution_score", 0.0)))),
                     6,
                 ),
+                "contribution_evidence": edge.get("contribution_evidence"),
                 "reason_code": reason_code,
                 "rtl_evidence": rtl_evidence,
                 "change_examples": edge.get("change_examples") or [],
@@ -924,11 +928,23 @@ class PreparedCausalAnalysis:
             )
             return _empty_graph(request, diagnostics)
 
+        try:
+            dependency_provider = InstanceGraph.from_parser(
+                self.parser,
+                self.artifact_by_path,
+            ).bind_waveform(self.waveform)
+        except InstanceGraphError as error:
+            diagnostics.append(
+                _diagnostic("rtl_construct_unsupported", str(error))
+            )
+            return _empty_graph(request, diagnostics, status="unsupported")
+
         slicer = BackwardSlicer(
             self.parser,
             self.waveform,
             max_depth=request.max_depth,
             max_nodes=request.max_nodes,
+            dependency_provider=dependency_provider,
             search_policy=request.search_policy.policy_id,
             max_expanded_nodes=request.max_expanded_nodes,
             max_candidate_evaluations=request.max_candidate_evaluations,

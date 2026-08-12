@@ -50,6 +50,10 @@ from .provenance import (
 _MAX_RAW_SLICE_DEPTH = 256
 
 
+def _clean_signal(signal: str) -> str:
+    return re.sub(r"\s*\[\d+:\d+\]$", "", signal)
+
+
 def _causal_provenance_hints(
     hints: list[Dict[str, Any]],
     parser: Any,
@@ -86,30 +90,6 @@ def _causal_provenance_hints(
         ):
             result.append(hint)
     return result
-
-
-class _SemanticBoundaryProvider:
-    """Stop raw recursion at registers represented by C2 semantic objects."""
-
-    def __init__(self, provider: Any, register_signals: set[str]):
-        self._provider = provider
-        self._register_signals = register_signals
-
-    @staticmethod
-    def _clean(signal: str) -> str:
-        return re.sub(r"\s*\[\d+:\d+\]$", "", signal)
-
-    def get_dependencies_for_signal(
-        self, signal: str, module_name: Optional[str] = None
-    ):
-        if self._clean(signal) in self._register_signals:
-            return []
-        return self._provider.get_dependencies_for_signal(
-            signal, module_name
-        )
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._provider, name)
 
 
 def _structural_request(request: CausalAnalysisRequest):
@@ -450,17 +430,6 @@ class PreparedCausalSession:
                 or re.sub(r"\s*\[\d+:\d+\]$", "", row["signal"])
                 in projection_members
             ]
-            # C2 register-transition objects own traversal across every
-            # recovered sequential boundary. Restricting this set to the
-            # endpoint projection lets unrelated registers expand once per
-            # cycle and makes the raw slice depend on Python recursion depth.
-            provider = _SemanticBoundaryProvider(
-                provider,
-                {
-                    re.sub(r"\s*\[\d+:\d+\]$", "", row["signal"])
-                    for row in all_transitions
-                },
-            )
         if not self._prepared.waveform.has_exact_signal(
             request.endpoint.signal
         ):
@@ -619,13 +588,13 @@ class PreparedCausalSession:
             signal_nodes.append({**node, "node_id": new_id})
         if self._normalized_design is not None and not projection_members:
             raw_signal_names = {
-                _SemanticBoundaryProvider._clean(str(row["signal"]))
+                _clean_signal(str(row["signal"]))
                 for row in signal_nodes
             }
             selected_transitions = [
                 row
                 for row in selected_transitions
-                if _SemanticBoundaryProvider._clean(str(row["signal"]))
+                if _clean_signal(str(row["signal"]))
                 in raw_signal_names
             ]
         graph_edges = []
@@ -805,7 +774,7 @@ class PreparedCausalSession:
             self._normalized_design is not None
             and c3_enabled(request.semantic_profile.features)
         ):
-            clean = _SemanticBoundaryProvider._clean
+            clean = _clean_signal
             raw_signals = {
                 clean(str(row["signal"])) for row in signal_nodes
             }

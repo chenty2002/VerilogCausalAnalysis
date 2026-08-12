@@ -9,7 +9,7 @@ from typing import Optional, Sequence
 
 from .identity import canonical_json_bytes, sha256_file
 from .structural_contract import make_structural_request
-from .local_search import POLICY_IDS, policy_identity
+from .local_search import policy_identity
 from .structural_engine import build_structural_graph
 
 
@@ -28,7 +28,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-expanded-nodes", type=int, default=120)
     parser.add_argument("--max-candidate-evaluations", type=int, default=960)
     parser.add_argument("--max-intervention-evaluations", type=int, default=3840)
-    parser.add_argument("--search-policy", choices=POLICY_IDS, default="legacy_dfs_v1")
     parser.add_argument("--random-seed", type=int, default=0)
     return parser
 
@@ -61,7 +60,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             clock_signal=args.clock,
             endpoint_signal=args.endpoint,
             endpoint_cycle=args.cycle,
-            search_policy=policy_identity(args.search_policy).to_dict(),
+            search_policy=policy_identity().to_dict(),
             max_depth=args.max_depth,
             max_nodes=args.max_nodes,
             max_expanded_nodes=args.max_expanded_nodes,
