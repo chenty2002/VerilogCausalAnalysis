@@ -86,6 +86,32 @@ def test_candidates_are_complete_exact_and_line_shift_stable(
     }
 
 
+def test_blocking_assignments_have_exact_lines(counter_request, tmp_path):
+    rtl = tmp_path / "case.v"
+    rtl.write_text(
+        "module Top(input wire clk, input wire a, output reg y);\n"
+        "  always @(*) begin\n"
+        "    if (a) y = 1'b1;\n"
+        "    else y = 1'b0;\n"
+        "  end\n"
+        "endmodule\n"
+    )
+    digest, size = sha256_file(rtl)
+    candidates = build_rtl_candidates(
+        _request(
+            counter_request,
+            [{
+                "artifact_id": "rtl_0001",
+                "path": str(rtl.resolve()),
+                "sha256": digest,
+                "bytes": size,
+            }],
+        )
+    )["candidates"]
+
+    assert [row["line_start"] for row in candidates] == [3, 4]
+
+
 def test_native_graph_edges_join_candidates_and_hash_drift_fails(
     counter_request, tmp_path
 ):

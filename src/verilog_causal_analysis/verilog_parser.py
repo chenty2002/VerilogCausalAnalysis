@@ -443,6 +443,7 @@ class VerilogParser:
         self.instance_module_map: Dict[str, Set[str]] = {}
         self.file_contents: Dict[str, str] = {}
         self.file_lines: Dict[str, List[str]] = {}
+        self._statement_line_hints: Dict[Tuple[str, str], List[int]] = {}
         # SVA assertion extraction, which hdlConvertor does not expose.
         self._re_assert_label = re.compile(
             r'^\s*(\w+)\s*:\s*assert\s+property\s*\(@\([^)]+\)\s*'
@@ -506,6 +507,21 @@ class VerilogParser:
         if end - start > max_lines:
             end = start + max_lines
         return '\n'.join(lines[start:end])
+
+    def _assignment_line(self, file_path: str, target: str) -> int:
+        key = (file_path, target)
+        lines = self._statement_line_hints.get(key)
+        if lines is None:
+            pattern = re.compile(
+                rf"\b{re.escape(target)}\s*(?:<=|=(?!=))"
+            )
+            lines = [
+                index
+                for index, line in enumerate(self.file_lines[file_path], 1)
+                if pattern.search(line)
+            ]
+            self._statement_line_hints[key] = lines
+        return lines.pop(0) if lines else 0
 
     def _port_binding_position(
         self,
@@ -912,11 +928,17 @@ class VerilogParser:
                     - module.constants
                 )
                 expr_str = self._expr_to_string(assign.ops[1])
+                line_start = self._assignment_line(file_path, target)
                 
                 dep_type = DependencyType.SEQUENTIAL if is_sequential else DependencyType.COMBINATIONAL
                 assignment_statement = StatementEvidence.create(
                     expression=expr_str,
                     file_path=file_path,
+                    line_start=line_start,
+                    line_end=line_start,
+                    code_snippet=self._get_code_snippet(
+                        file_path, line_start, line_start
+                    ),
                     condition=condition,
                     module_name=module.name,
                     target=target,
@@ -933,8 +955,8 @@ class VerilogParser:
                         is_sequential,
                         assignment_statement.statement_id,
                         file_path,
-                        0,
-                        0,
+                        line_start,
+                        line_start,
                     )
                 )
                 
@@ -947,8 +969,11 @@ class VerilogParser:
                             dep_type=dep_type,
                             expression=expr_str,
                             file_path=file_path,
-                            line_start=0,
-                            line_end=0,
+                            line_start=line_start,
+                            line_end=line_start,
+                            code_snippet=self._get_code_snippet(
+                                file_path, line_start, line_start
+                            ),
                             condition=condition
                         )
                         self._add_dependency(module, dep)
@@ -962,8 +987,11 @@ class VerilogParser:
                             dep_type=dep_type,
                             expression=expr_str,
                             file_path=file_path,
-                            line_start=0,
-                            line_end=0,
+                            line_start=line_start,
+                            line_end=line_start,
+                            code_snippet=self._get_code_snippet(
+                                file_path, line_start, line_start
+                            ),
                             condition=condition
                         )
                         self._add_dependency(module, dep)
