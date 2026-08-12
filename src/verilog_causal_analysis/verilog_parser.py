@@ -113,6 +113,35 @@ class StatementEvidence:
             target_qualified=target_qualified,
         )
 
+    @classmethod
+    def create_guard(
+        cls,
+        *,
+        condition: str,
+        enclosed_statement_ids: Iterable[str],
+        file_path: str,
+        line_start: int,
+        line_end: int,
+        code_snippet: str,
+        module_name: str,
+    ) -> "StatementEvidence":
+        normalized = re.sub(r"\s+", "", condition)
+        identity = "\x1f".join(
+            (module_name, normalized, *sorted(enclosed_statement_ids))
+        )
+        return cls(
+            statement_id=(
+                "vcs_"
+                + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+            ),
+            file_path=file_path,
+            line_start=line_start,
+            line_end=line_end,
+            code_snippet=code_snippet,
+            condition=normalized,
+            module_name=module_name,
+        )
+
 
 @dataclass(init=False, slots=True)
 class Dependency:
@@ -376,6 +405,19 @@ class AssignmentRecord:
 
 
 @dataclass
+class ConditionalGuardRecord:
+    """Exact executable guard and the statements controlled by it."""
+
+    condition: str
+    is_sequential: bool
+    statement_id: str
+    enclosed_statement_ids: Tuple[str, ...]
+    file_path: str
+    line_start: int
+    line_end: int
+
+
+@dataclass
 class ModuleInfo:
     """Verilog module information."""
     name: str
@@ -385,8 +427,10 @@ class ModuleInfo:
     ports: Dict[str, SignalInfo] = field(default_factory=dict)
     signals: Dict[str, SignalInfo] = field(default_factory=dict)
     constants: Set[str] = field(default_factory=set)
+    constant_values: Dict[str, Optional[str]] = field(default_factory=dict)
     dependencies: List[Dependency] = field(default_factory=list)
     assignment_records: List[AssignmentRecord] = field(default_factory=list)
+    guard_records: List[ConditionalGuardRecord] = field(default_factory=list)
     submodule_instances: List[Tuple[str, str, int]] = field(default_factory=list)
 
 
@@ -798,7 +842,10 @@ class VerilogParser:
             return node.val
         if isinstance(node, HdlValueInt):
             if hasattr(node, 'bits') and node.bits:
-                return f"{node.bits}'h{node.val}"
+                base = {2: "b", 8: "o", 10: "d", 16: "h"}.get(
+                    getattr(node, "base", None), "d"
+                )
+                return f"{node.bits}'{base}{node.val}"
             return str(node.val)
         if isinstance(node, HdlOp):
             fn_name = _OP_MAP.get(node.fn, str(node.fn).split('.')[-1])
@@ -996,6 +1043,83 @@ class VerilogParser:
                         )
                         self._add_dependency(module, dep)
     
+    @staticmethod
+    def _join_conditions(*conditions: str) -> str:
+        return " && ".join(
+            f"({item})" for item in conditions if item
+        )
+
+    def _guard_line(
+        self,
+        file_path: str,
+        condition: str,
+        line_start: int,
+        line_end: int,
+        before_line: int = 0,
+    ) -> int:
+        needle = re.sub(r"[\s()_]", "", condition)
+        text = []
+        lines = []
+        if line_start <= 0 or line_end <= 0:
+            line_start, line_end = 1, len(self.file_lines[file_path])
+        for line in range(
+            max(1, line_start),
+            min(len(self.file_lines[file_path]), line_end) + 1,
+        ):
+            for char in self.file_lines[file_path][line - 1]:
+                if char.isspace() or char in "()_":
+                    continue
+                text.append(char)
+                lines.append(line)
+        haystack = "".join(text)
+        positions = [
+            index
+            for index in range(len(haystack))
+            if needle and haystack.startswith(needle, index)
+        ]
+        matched_lines = sorted({lines[index] for index in positions})
+        if len(matched_lines) == 1:
+            return matched_lines[0]
+        preceding = [line for line in matched_lines if before_line and line < before_line]
+        return preceding[-1] if preceding else 0
+
+    def _record_guard(
+        self,
+        module: ModuleInfo,
+        file_path: str,
+        condition: str,
+        is_sequential: bool,
+        enclosed_statement_ids: Iterable[str],
+        line_start: int,
+        line_end: int,
+    ) -> None:
+        enclosed = tuple(sorted(set(enclosed_statement_ids)))
+        if not enclosed:
+            return
+        statement = StatementEvidence.create_guard(
+            condition=condition,
+            enclosed_statement_ids=enclosed,
+            file_path=file_path,
+            line_start=line_start,
+            line_end=line_end,
+            code_snippet=self._get_code_snippet(
+                file_path, line_start, line_end, max_lines=1
+            ),
+            module_name=module.name,
+        )
+        self._intern_statement(statement)
+        module.guard_records.append(
+            ConditionalGuardRecord(
+                condition=statement.condition,
+                is_sequential=is_sequential,
+                statement_id=statement.statement_id,
+                enclosed_statement_ids=enclosed,
+                file_path=file_path,
+                line_start=line_start,
+                line_end=line_end,
+            )
+        )
+
     def _process_statement(self, stmt, module: ModuleInfo, file_path: str,
                            is_sequential: bool, condition: str = "",
                            condition_sources: Optional[Set[str]] = None):
@@ -1008,39 +1132,86 @@ class VerilogParser:
             self._process_assignment(stmt, module, file_path, is_sequential, condition, condition_sources)
         
         elif isinstance(stmt, HdlStmIf):
-            # Extract condition
             cond_str = self._expr_to_string(stmt.cond) if stmt.cond else ""
-            new_condition = f"{condition} && {cond_str}" if condition else cond_str
-            new_condition_sources = set(condition_sources)
-            if stmt.cond is not None:
-                new_condition_sources.update(self._extract_signals_from_expr(stmt.cond))
-            
-            # Process if-true branch
+            prior_conditions = [cond_str]
+            new_condition = self._join_conditions(condition, cond_str)
+            new_condition_sources = set(condition_sources) | self._extract_signals_from_expr(stmt.cond)
+            branch_start = len(module.assignment_records)
             if stmt.if_true:
                 self._process_statement(
                     stmt.if_true, module, file_path, is_sequential,
                     new_condition, new_condition_sources
                 )
-            
-            # Process elif branches
+            start, end = self._get_position(stmt)
+            enclosed = module.assignment_records[branch_start:]
+            line = self._guard_line(
+                file_path,
+                cond_str,
+                start,
+                end,
+                min((row.line_start for row in enclosed if row.line_start > 0), default=0),
+            )
+            self._record_guard(
+                module, file_path, new_condition, is_sequential,
+                (row.statement_id for row in enclosed),
+                line, line,
+            )
+
             if hasattr(stmt, 'elifs') and stmt.elifs:
                 for elif_cond, elif_body in stmt.elifs:
                     elif_cond_str = self._expr_to_string(elif_cond)
+                    exclusions = [f"!({item})" for item in prior_conditions]
+                    elif_path = self._join_conditions(
+                        condition, *exclusions, elif_cond_str
+                    )
                     elif_sources = set(condition_sources)
+                    for item in prior_conditions:
+                        elif_sources.update(self._extract_signals_from_text(item))
                     elif_sources.update(self._extract_signals_from_expr(elif_cond))
+                    branch_start = len(module.assignment_records)
                     self._process_statement(
                         elif_body, module, file_path, is_sequential,
-                        f"{condition} && {elif_cond_str}" if condition else elif_cond_str,
+                        elif_path,
                         elif_sources
                     )
-            
-            # Process else branch
+                    enclosed = module.assignment_records[branch_start:]
+                    line = self._guard_line(
+                        file_path,
+                        elif_cond_str,
+                        start,
+                        end,
+                        min(
+                            (row.line_start for row in enclosed if row.line_start > 0),
+                            default=0,
+                        ),
+                    )
+                    self._record_guard(
+                        module, file_path, elif_path, is_sequential,
+                        (row.statement_id for row in enclosed),
+                        line, line,
+                    )
+                    prior_conditions.append(elif_cond_str)
+
             if stmt.if_false:
-                neg_condition = f"!({cond_str})" if cond_str else ""
+                neg_conditions = [f"!({item})" for item in prior_conditions]
+                else_path = self._join_conditions(condition, *neg_conditions)
+                else_sources = set(condition_sources)
+                for item in prior_conditions:
+                    else_sources.update(self._extract_signals_from_text(item))
+                branch_start = len(module.assignment_records)
                 self._process_statement(
                     stmt.if_false, module, file_path, is_sequential,
-                    f"{condition} && {neg_condition}" if condition else neg_condition,
-                    new_condition_sources
+                    else_path, else_sources
+                )
+                enclosed = module.assignment_records[branch_start:]
+                else_line = min(
+                    (row.line_start for row in enclosed if row.line_start > 0),
+                    default=0,
+                )
+                self._record_guard(
+                    module, file_path, else_path, is_sequential,
+                    (row.statement_id for row in enclosed),
+                    else_line, else_line,
                 )
         
         elif isinstance(stmt, HdlStmBlock):
@@ -1051,21 +1222,51 @@ class VerilogParser:
                 )
         
         elif isinstance(stmt, HdlStmCase):
-            # Process case statement
             case_expr = getattr(stmt, 'switch_on', None)
             case_expr_str = self._expr_to_string(case_expr) if case_expr is not None else "case"
             case_sources = set(condition_sources)
             if case_expr is not None:
                 case_sources.update(self._extract_signals_from_expr(case_expr))
-            if hasattr(stmt, 'cases'):
-                for case_val, case_body in stmt.cases:
-                    case_cond = self._expr_to_string(case_val) if case_val else "default"
-                    full_case_cond = f"{case_expr_str}=={case_cond}" if case_cond != "default" else "default"
-                    self._process_statement(
-                        case_body, module, file_path, is_sequential,
-                        f"{condition} && {full_case_cond}" if condition else full_case_cond,
-                        case_sources
-                    )
+            case_conditions = []
+            for case_val, case_body in getattr(stmt, 'cases', ()) or ():
+                case_cond = self._expr_to_string(case_val)
+                item_cond = f"({case_expr_str} == {case_cond})"
+                case_conditions.append(item_cond)
+                full_path = self._join_conditions(condition, item_cond)
+                branch_start = len(module.assignment_records)
+                self._process_statement(
+                    case_body, module, file_path, is_sequential,
+                    full_path, case_sources
+                )
+                enclosed = module.assignment_records[branch_start:]
+                item_line = min(
+                    (row.line_start for row in enclosed if row.line_start > 0),
+                    default=0,
+                )
+                self._record_guard(
+                    module, file_path, full_path, is_sequential,
+                    (row.statement_id for row in enclosed),
+                    item_line, item_line,
+                )
+            default_body = getattr(stmt, "default", None)
+            if default_body is not None:
+                default_cond = "!(" + " || ".join(case_conditions) + ")"
+                full_path = self._join_conditions(condition, default_cond)
+                branch_start = len(module.assignment_records)
+                self._process_statement(
+                    default_body, module, file_path, is_sequential,
+                    full_path, case_sources
+                )
+                enclosed = module.assignment_records[branch_start:]
+                item_line = min(
+                    (row.line_start for row in enclosed if row.line_start > 0),
+                    default=0,
+                )
+                self._record_guard(
+                    module, file_path, full_path, is_sequential,
+                    (row.statement_id for row in enclosed),
+                    item_line, item_line,
+                )
         
         elif isinstance(stmt, HdlIdDef):
             # Local variable declaration, might have initial value
@@ -1133,6 +1334,16 @@ class VerilogParser:
             str(getattr(param.name, "val", param.name))
             for param in (getattr(obj.dec, "params", ()) or ())
         )
+        module.constant_values.update(
+            {
+                str(getattr(param.name, "val", param.name)): (
+                    self._expr_to_string(param.value)
+                    if getattr(param, "value", None) is not None
+                    else None
+                )
+                for param in (getattr(obj.dec, "params", ()) or ())
+            }
+        )
         if obj.dec and hasattr(obj.dec, "ports"):
             for port in obj.dec.ports:
                 port_name = (
@@ -1165,6 +1376,18 @@ class VerilogParser:
             str(getattr(row.name, "val", row.name))
             for row in obj.objs
             if isinstance(row, HdlIdDef) and getattr(row, "is_const", False)
+        )
+        module.constant_values.update(
+            {
+                str(getattr(row.name, "val", row.name)): (
+                    self._expr_to_string(row.value)
+                    if getattr(row, "value", None) is not None
+                    else None
+                )
+                for row in obj.objs
+                if isinstance(row, HdlIdDef)
+                and getattr(row, "is_const", False)
+            }
         )
         for body_obj in obj.objs:
             if isinstance(body_obj, HdlIdDef):
@@ -1537,6 +1760,7 @@ class VerilogParser:
                         list(row)
                         for row in sorted(module.submodule_instances)
                     ],
+                    "constant_values": dict(sorted(module.constant_values.items())),
                     "assignment_records": [
                         {
                             "target": row.target,
@@ -1559,27 +1783,41 @@ class VerilogParser:
                             ),
                         )
                     ],
+                    "guard_records": [
+                        {
+                            "condition": row.condition,
+                            "is_sequential": row.is_sequential,
+                            "statement_id": row.statement_id,
+                            "enclosed_statement_ids": list(row.enclosed_statement_ids),
+                            "artifact_id": artifact_id(row.file_path),
+                            "line_start": row.line_start,
+                            "line_end": row.line_end,
+                        }
+                        for row in sorted(
+                            module.guard_records,
+                            key=lambda row: row.statement_id,
+                        )
+                    ],
                 }
             )
 
-        statements: Dict[str, Dict[str, Any]] = {}
+        statements: Dict[str, Dict[str, Any]] = {
+            statement_id: {
+                "statement_id": statement.statement_id,
+                "expression": statement.expression,
+                "artifact_id": artifact_id(statement.file_path),
+                "line_start": statement.line_start,
+                "line_end": statement.line_end,
+                "code_snippet": statement.code_snippet,
+                "condition": statement.condition,
+                "module_name": statement.module_name,
+                "target": statement.target,
+                "target_qualified": statement.target_qualified,
+            }
+            for statement_id, statement in self._statement_evidence.items()
+        }
         dependencies = []
         for dependency in self.all_dependencies:
-            statements.setdefault(
-                dependency.statement_id,
-                {
-                    "statement_id": dependency.statement_id,
-                    "expression": dependency.expression,
-                    "artifact_id": artifact_id(dependency.file_path),
-                    "line_start": dependency.line_start,
-                    "line_end": dependency.line_end,
-                    "code_snippet": dependency.code_snippet,
-                    "condition": dependency.condition,
-                    "module_name": dependency.module_name,
-                    "target": dependency.target,
-                    "target_qualified": dependency.target_qualified,
-                },
-            )
             dependencies.append(
                 {
                     "statement_id": dependency.statement_id,
@@ -1591,7 +1829,7 @@ class VerilogParser:
                 }
             )
         return {
-            "schema_version": "parsed_design_cache",
+            "schema_version": "parsed_design_cache.v2",
             "modules": modules,
             "statements": [
                 statements[statement_id]
@@ -1609,7 +1847,7 @@ class VerilogParser:
         strict: bool = True,
     ) -> "VerilogParser":
         """Restore a validated path-free prepared-design payload."""
-        if payload.get("schema_version") != "parsed_design_cache":
+        if payload.get("schema_version") != "parsed_design_cache.v2":
             raise ValueError("unsupported parsed-design cache schema")
         parser = cls(strict=strict)
 
@@ -1634,6 +1872,13 @@ class VerilogParser:
                     )
                 ],
             )
+            module.constant_values.update(
+                {
+                    str(name): None if value is None else str(value)
+                    for name, value in module_row.get("constant_values", {}).items()
+                }
+            )
+            module.constants.update(module.constant_values)
             for signal_row in module_row.get("signals", []):
                 signal = SignalInfo(
                     name=str(signal_row["name"]),
@@ -1683,6 +1928,21 @@ class VerilogParser:
                         line_end=int(assignment_row["line_end"]),
                     )
                 )
+            for guard_row in module_row.get("guard_records", []):
+                module.guard_records.append(
+                    ConditionalGuardRecord(
+                        condition=str(guard_row["condition"]),
+                        is_sequential=bool(guard_row["is_sequential"]),
+                        statement_id=str(guard_row["statement_id"]),
+                        enclosed_statement_ids=tuple(
+                            str(item)
+                            for item in guard_row["enclosed_statement_ids"]
+                        ),
+                        file_path=source_path(str(guard_row["artifact_id"])),
+                        line_start=int(guard_row["line_start"]),
+                        line_end=int(guard_row["line_end"]),
+                    )
+                )
             for instance_name, child_module, _line in (
                 module.submodule_instances
             ):
@@ -1690,6 +1950,11 @@ class VerilogParser:
                     instance_name, set()
                 ).add(child_module)
 
+        guards = {
+            row.statement_id: row
+            for module in parser.modules.values()
+            for row in module.guard_records
+        }
         statements: Dict[str, StatementEvidence] = {}
         for statement_row in payload.get("statements", []):
             statement_id = str(statement_row["statement_id"])
@@ -1705,8 +1970,18 @@ class VerilogParser:
                 target=str(statement_row["target"]),
                 target_qualified=str(statement_row["target_qualified"]),
             )
-            if (
-                StatementEvidence.create(
+            expected = (
+                StatementEvidence.create_guard(
+                    condition=statement.condition,
+                    enclosed_statement_ids=guards[statement_id].enclosed_statement_ids,
+                    file_path=statement.file_path,
+                    line_start=statement.line_start,
+                    line_end=statement.line_end,
+                    code_snippet=statement.code_snippet,
+                    module_name=statement.module_name,
+                )
+                if statement_id in guards
+                else StatementEvidence.create(
                     expression=statement.expression,
                     file_path=statement.file_path,
                     line_start=statement.line_start,
@@ -1716,13 +1991,14 @@ class VerilogParser:
                     module_name=statement.module_name,
                     target=statement.target,
                     target_qualified=statement.target_qualified,
-                ).statement_id
-                != statement_id
-            ):
+                )
+            )
+            if expected.statement_id != statement_id:
                 raise ValueError("parsed-design statement identity mismatch")
             if statement_id in statements:
                 raise ValueError("duplicate parsed-design statement ID")
             statements[statement_id] = statement
+            parser._statement_evidence[statement_id] = statement
 
         for dependency_row in payload.get("dependencies", []):
             statement_id = str(dependency_row["statement_id"])
@@ -1751,7 +2027,6 @@ class VerilogParser:
                 ),
                 statement=statement,
             )
-            parser._statement_evidence[statement_id] = statement
             parser._add_dependency(
                 parser.modules[module_name], dependency
             )

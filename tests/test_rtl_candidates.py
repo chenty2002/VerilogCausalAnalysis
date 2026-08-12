@@ -1,4 +1,6 @@
+import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -14,7 +16,15 @@ from verilog_causal_analysis.identity import stable_set_sha256
 from test_verilog_profile import BOUNDS
 
 
-def _request(counter_request, rtl_files, *, trace=None, clock=None, endpoint=None):
+def _request(
+    counter_request,
+    rtl_files,
+    *,
+    trace=None,
+    clock=None,
+    endpoint=None,
+    cycle=None,
+):
     return make_request(
         trace=trace
         or {"artifact_id": "trace_0001", **counter_request.trace.to_dict()},
@@ -27,7 +37,7 @@ def _request(counter_request, rtl_files, *, trace=None, clock=None, endpoint=Non
         clock={"signal": clock or counter_request.clock_signal, "edge": "rising"},
         endpoint={
             "signal": endpoint or counter_request.endpoint_signal,
-            "cycle": counter_request.endpoint_cycle,
+            "cycle": counter_request.endpoint_cycle if cycle is None else cycle,
             "projection": None,
         },
         semantic_inputs=[],
@@ -35,6 +45,40 @@ def _request(counter_request, rtl_files, *, trace=None, clock=None, endpoint=Non
         bounds=BOUNDS,
         random_seed=0,
         strict=True,
+    )
+
+
+def _pilot_request(counter_request, case, *, cycle=None):
+    case_root = (
+        Path(__file__).resolve().parents[2]
+        / "runs/verilogcause/20260812-native-pilot-v5/cases"
+        / case
+    )
+    rtl = case_root / "model_inputs/sanitized_faulty/design.v"
+    trace = rtl.parent / "dump.fst"
+    graph = json.loads(
+        (case_root / "model_inputs/causal_graph.json").read_text()
+    )
+    rtl_hash, rtl_bytes = sha256_file(rtl)
+    trace_hash, trace_bytes = sha256_file(trace)
+    return _request(
+        counter_request,
+        [{
+            "artifact_id": "rtl_0001",
+            "path": str(rtl),
+            "sha256": rtl_hash,
+            "bytes": rtl_bytes,
+        }],
+        trace={
+            "artifact_id": "trace_0001",
+            "path": str(trace),
+            "format": "fst",
+            "sha256": trace_hash,
+            "bytes": trace_bytes,
+        },
+        clock="testbench.clk",
+        endpoint=graph["endpoint"]["signal"],
+        cycle=cycle,
     )
 
 
@@ -109,7 +153,15 @@ def test_blocking_assignments_have_exact_lines(counter_request, tmp_path):
         )
     )["candidates"]
 
-    assert [row["line_start"] for row in candidates] == [3, 4]
+    assignments = [
+        row for row in candidates if row["statement_kind"] == "assignment"
+    ]
+    guards = [
+        row for row in candidates
+        if row["statement_kind"] == "conditional_guard"
+    ]
+    assert [row["line_start"] for row in assignments] == [3, 4]
+    assert sorted(row["line_start"] for row in guards) == [3, 4]
 
 
 def test_native_graph_edges_join_candidates_and_hash_drift_fails(
@@ -166,6 +218,23 @@ def test_native_graph_edges_join_candidates_and_hash_drift_fails(
     )
     candidates = build_rtl_candidates(request)
     graph = build_causal_graph(request)
+    activations = [
+        row for row in graph["edges"]
+        if row.get("relation") == "active_statement_write"
+    ]
+    assert activations
+    assert all(
+        row["activation_status"] == "active_exact"
+        and row["dst_node_id"] == row["target_node_id"]
+        and row.get("src_semantic_id")
+        for row in activations
+    )
+    activation_ids = {row["src_semantic_id"] for row in activations}
+    assert activation_ids <= {
+        row["semantic_id"]
+        for row in graph["semantic_nodes"]
+        if row["type"] == "rtl_statement_activation"
+    }
     universe = {
         (row["artifact_id"], row["statement_id"])
         for row in candidates["candidates"]
@@ -204,3 +273,53 @@ def test_native_graph_edges_join_candidates_and_hash_drift_fails(
                 }
             )
         )
+
+
+def test_wit_hw_guard_candidates_and_exact_active_writes(counter_request):
+    expected_candidates = {
+        "alu_2": {("assignment", 22)},
+        "counter-3": {("conditional_guard", 38)},
+        "fsm_16-3": {("conditional_guard", 88)},
+        "fsm_16-4": {
+            ("conditional_guard", 45),
+            ("conditional_guard", 52),
+        },
+    }
+    for case, expected in expected_candidates.items():
+        universe = build_rtl_candidates(
+            _pilot_request(counter_request, case)
+        )
+        assert universe["schema_version"] == "rtl_candidate_universe.v2"
+        actual = {
+            (row["statement_kind"], row["line_start"])
+            for row in universe["candidates"]
+        }
+        assert expected <= actual
+
+    for case, cycle, expected_line, rejected_line in (
+        ("alu_3", 0, 26, 28),
+        ("alu_5", 1, 28, 26),
+        ("alu_6", 0, 34, 32),
+        ("fsm_16-1", 4, 79, 34),
+        ("fsm_16-2", 4, 101, 34),
+    ):
+        request = _pilot_request(counter_request, case, cycle=cycle)
+        graph = build_causal_graph(request)
+        endpoint_id = next(
+            row["node_id"]
+            for row in graph["signal_nodes"]
+            if row["signal"] == request.endpoint.signal
+            and row["cycle"] == cycle
+        )
+        candidates = {
+            row["statement_id"]: row
+            for row in build_rtl_candidates(request)["candidates"]
+        }
+        active_lines = {
+            candidates[row["statement_id"]]["line_start"]
+            for row in graph["edges"]
+            if row.get("relation") == "active_statement_write"
+            and row["target_node_id"] == endpoint_id
+        }
+        assert expected_line in active_lines
+        assert rejected_line not in active_lines

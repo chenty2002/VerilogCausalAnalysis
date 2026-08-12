@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
-from .causal_slicer import BackwardSlicer
+from .causal_slicer import BackwardSlicer, ExpressionEvaluator
 from .chisel_semantics import (
     build_normalized_design,
     c2_enabled,
@@ -175,6 +175,193 @@ def _session_identity(request: CausalAnalysisRequest) -> Dict[str, Any]:
         if item.get("kind") != "assertion_endpoint_projection"
     ]
     return row
+
+
+def _known_binary(value: Optional[str]) -> bool:
+    return bool(value) and not set(str(value).lower()) & {"x", "z"}
+
+
+def _same_verilog_value(left: str, right: str) -> bool:
+    return _known_binary(left) and _known_binary(right) and int(left, 2) == int(right, 2)
+
+
+def _constant_environment(values: Mapping[str, Optional[str]]) -> Dict[str, str]:
+    pending = {name: expr for name, expr in values.items() if expr}
+    result: Dict[str, str] = {}
+    while pending:
+        changed = False
+        for name, expression in list(pending.items()):
+            value = ExpressionEvaluator(result).evaluate(str(expression))
+            if _known_binary(value):
+                result[name] = str(value)
+                pending.pop(name)
+                changed = True
+        if not changed:
+            break
+    return result
+
+
+def _statement_activation_layer(
+    *,
+    parser: VerilogParser,
+    instance_graph: InstanceGraph,
+    waveform: Any,
+    artifact_by_path: Mapping[str, str],
+    identity: Mapping[str, Any],
+    signal_nodes: list[Mapping[str, Any]],
+) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]], list[Dict[str, Any]]]:
+    """Evaluate exact executable writes for every admitted signal node."""
+
+    semantic_nodes: list[Dict[str, Any]] = []
+    edges: list[Dict[str, Any]] = []
+    diagnostics: list[Dict[str, Any]] = []
+    index_pattern = re.compile(r"\b([A-Za-z_$][\w$]*)\[(\d+)\]")
+
+    def value_at(instance_path: str, signal: str, cycle: int) -> Optional[str]:
+        resolution = waveform.resolve_signal(
+            signal, instance_path, prefer_hierarchy=True
+        )
+        if resolution.ambiguous or resolution.resolved_signal is None:
+            return None
+        return waveform.get_signal_value(resolution.resolved_signal, cycle)
+
+    for target_node in signal_nodes:
+        resolution = instance_graph.resolve_signal(str(target_node["signal"]))
+        if not resolution.exact or not resolution.local_signal:
+            continue
+        module = parser.modules[resolution.module_name]
+        records = [
+            row
+            for row in module.assignment_records
+            if _clean_signal(row.target) == _clean_signal(resolution.local_signal)
+        ]
+        if not records:
+            continue
+        cycle = int(target_node["cycle"])
+        observed = waveform.get_signal_value(str(target_node["signal"]), cycle)
+        active = []
+        unavailable = []
+        constants = _constant_environment(module.constant_values)
+        for record in records:
+            sample_cycle = cycle - 1 if record.is_sequential else cycle
+            if sample_cycle < 0 or not _known_binary(observed):
+                unavailable.append(record.statement_id)
+                continue
+            environment = dict(constants)
+            expressions = (record.condition, record.expression)
+            missing = False
+            names = {
+                name
+                for expression in expressions
+                for name in re.findall(r"\b[A-Za-z_$][\w$]*\b", expression)
+                if name in module.signals
+            }
+            for name in sorted(names):
+                value = value_at(
+                    str(resolution.instance_path), name, sample_cycle
+                )
+                if not _known_binary(value):
+                    missing = True
+                    break
+                environment[name] = str(value)
+            if missing:
+                unavailable.append(record.statement_id)
+                continue
+            for expression in expressions:
+                for name, raw_index in index_pattern.findall(expression):
+                    value = environment.get(name)
+                    index = int(raw_index)
+                    if value is None or index >= len(value):
+                        missing = True
+                        break
+                    environment[f"{name}[{index}]"] = value[-index - 1]
+            if missing:
+                unavailable.append(record.statement_id)
+                continue
+            guard = (
+                ExpressionEvaluator(environment).evaluate(record.condition)
+                if record.condition
+                else "1"
+            )
+            if not _known_binary(guard):
+                unavailable.append(record.statement_id)
+                continue
+            if int(str(guard), 2) == 0:
+                continue
+            result = ExpressionEvaluator(environment).evaluate(record.expression)
+            if result is None or not _known_binary(str(result)):
+                unavailable.append(record.statement_id)
+                continue
+            if not _same_verilog_value(str(result), str(observed)):
+                continue
+            active.append(record)
+
+        if unavailable or len(active) > 1:
+            status = "ambiguous" if len(active) > 1 else "unavailable"
+            diagnostics.append(
+                {
+                    "code": f"statement_activation_{status}",
+                    "message": (
+                        f"{target_node['signal']} at cycle {cycle} has no unique "
+                        "exact executable write"
+                    ),
+                    "target_node_id": target_node["node_id"],
+                    "cycle": cycle,
+                    "activation_status": status,
+                    "statement_ids": sorted(
+                        {row.statement_id for row in active} | set(unavailable)
+                    ),
+                    "breaks_complete": True,
+                }
+            )
+            continue
+        if not active:
+            continue
+
+        assignment = active[0]
+        statements = [
+            (assignment.statement_id, "active_statement_write")
+        ]
+        statements.extend(
+            (guard.statement_id, "active_guard")
+            for guard in module.guard_records
+            if assignment.statement_id in guard.enclosed_statement_ids
+        )
+        for statement_id, relation in statements:
+            statement = parser._statement_evidence[statement_id]
+            artifact_id = artifact_by_path[str(Path(statement.file_path).resolve())]
+            semantic_id = stable_id(
+                "vcsa_", identity, statement_id, target_node["node_id"], cycle,
+                length=24,
+            )
+            node = {
+                "semantic_id": semantic_id,
+                "type": "rtl_statement_activation",
+                "artifact_id": artifact_id,
+                "statement_id": statement_id,
+                "target_node_id": target_node["node_id"],
+                "cycle": cycle,
+                "activation_status": "active_exact",
+            }
+            if node not in semantic_nodes:
+                semantic_nodes.append(node)
+            edges.append(
+                {
+                    "edge_id": stable_id(
+                        "vcse_", identity, semantic_id, target_node["node_id"],
+                        relation, length=24,
+                    ),
+                    "src_semantic_id": semantic_id,
+                    "dst_node_id": target_node["node_id"],
+                    "target_node_id": target_node["node_id"],
+                    "relation": relation,
+                    "artifact_id": artifact_id,
+                    "statement_id": statement_id,
+                    "cycle": cycle,
+                    "activation_status": "active_exact",
+                }
+            )
+    return semantic_nodes, edges, diagnostics
 
 
 def _empty_graph(
@@ -646,7 +833,19 @@ class PreparedCausalSession:
             if "edge_id" in event:
                 event["edge_id"] = edge_ids.get(event["edge_id"], event["edge_id"])
             self.search_trace.append(event)
-        semantic_nodes = []
+        (
+            semantic_nodes,
+            activation_edges,
+            activation_diagnostics,
+        ) = _statement_activation_layer(
+            parser=self._prepared.parser,
+            instance_graph=self.instance_graph,
+            waveform=self._prepared.waveform,
+            artifact_by_path=self._prepared.artifact_by_path,
+            identity=identity,
+            signal_nodes=signal_nodes,
+        )
+        graph_edges.extend(activation_edges)
         projection_id = None
         if projection is not None:
             projection_id = projection.projection_id
@@ -1132,6 +1331,7 @@ class PreparedCausalSession:
         all_diagnostics.extend(c3_diagnostics)
         all_diagnostics.extend(temporal_diagnostics)
         all_diagnostics.extend(waitfor_diagnostics)
+        all_diagnostics.extend(activation_diagnostics)
         all_diagnostics = _classify_internal_waveform_frontiers(
             all_diagnostics
         )
@@ -1317,6 +1517,11 @@ def build_rtl_candidates(
         for module in parser.modules.values()
         for row in module.assignment_records
     }
+    guards = {
+        row.statement_id
+        for module in parser.modules.values()
+        for row in module.guard_records
+    }
     dependency_types: Dict[str, set[DependencyType]] = {}
     for dependency in parser.all_dependencies:
         dependency_types.setdefault(dependency.statement_id, set()).add(
@@ -1337,7 +1542,9 @@ def build_rtl_candidates(
                 f"statement {statement_id} lacks exact source identity"
             )
         kind = (
-            "port_binding"
+            "conditional_guard"
+            if statement_id in guards
+            else "port_binding"
             if types & {DependencyType.PORT_INPUT, DependencyType.PORT_OUTPUT}
             else "register_update"
             if records.get(statement_id)
@@ -1355,7 +1562,7 @@ def build_rtl_candidates(
             }
         )
     return {
-        "schema_version": "rtl_candidate_universe.v1",
+        "schema_version": "rtl_candidate_universe.v2",
         "rtl_set_sha256": _identity(request)["rtl_set_sha256"],
         "candidates": sorted(
             candidates,
