@@ -130,7 +130,8 @@ class CycleAlignedWaveform:
         self._transition_misses = 0
         self._transition_evictions = 0
         self._transition_overflow_signals: set[str] = set()
-        self._value_buffer = pylibfst.ffi.new("char[256]")
+        value_width = max((signal.length for signal in self.signals.by_name.values()), default=1)
+        self._value_buffer = pylibfst.ffi.new(f"char[{value_width + 1}]")
         
         # Initialize cycle boundaries
         self._build_cycle_boundaries()

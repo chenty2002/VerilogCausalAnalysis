@@ -7,7 +7,11 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
-from .causal_slicer import BackwardSlicer, ExpressionEvaluator
+from .causal_slicer import (
+    BackwardSlicer,
+    ExpressionEvaluator,
+    parse_binary_value,
+)
 from .chisel_semantics import (
     build_normalized_design,
     c2_enabled,
@@ -225,6 +229,53 @@ def _statement_activation_layer(
             return None
         return waveform.get_signal_value(resolution.resolved_signal, cycle)
 
+    def written_bits(
+        record: Any,
+        module: Any,
+        target: str,
+        constants: Mapping[str, str],
+    ) -> set[int]:
+        width = module.signals[target].width
+        targets = record.targets or (record.target,)
+        if len(targets) > 1:
+            return set(range(width))
+        expression = record.target_expression or record.target
+        match = re.fullmatch(r"[A-Za-z_$][\w$]*\[(.+)\]", expression)
+        if not match:
+            return set(range(width))
+        bounds = ExpressionEvaluator._split_index_range(match.group(1))
+        indexes = [
+            parse_binary_value(ExpressionEvaluator(dict(constants)).evaluate(bound))
+            for bound in bounds
+        ]
+        if any(index is None or index >= width for index in indexes):
+            return set()
+        if len(indexes) == 1:
+            return {int(indexes[0])}
+        step = -1 if indexes[0] >= indexes[1] else 1
+        return set(range(indexes[0], indexes[1] + step, step))
+
+    def assigned_value(
+        record: Any,
+        result: str,
+        observed: str,
+        module: Any,
+        target: str,
+        constants: Mapping[str, str],
+    ) -> tuple[str, Optional[str]]:
+        targets = record.targets or (record.target,)
+        if len(targets) > 1:
+            widths = [module.signals[name].width for name in targets]
+            total = sum(widths)
+            value = result.zfill(total)[-total:]
+            offset = sum(widths[:targets.index(target)])
+            return value[offset:offset + module.signals[target].width], observed
+        expression = record.target_expression or record.target
+        selected = ExpressionEvaluator(
+            {**constants, target: observed}
+        ).evaluate(expression)
+        return result, selected
+
     for target_node in signal_nodes:
         resolution = instance_graph.resolve_signal(str(target_node["signal"]))
         if not resolution.exact or not resolution.local_signal:
@@ -233,7 +284,8 @@ def _statement_activation_layer(
         records = [
             row
             for row in module.assignment_records
-            if _clean_signal(row.target) == _clean_signal(resolution.local_signal)
+            if _clean_signal(resolution.local_signal)
+            in {_clean_signal(name) for name in (row.targets or (row.target,))}
         ]
         if not records:
             continue
@@ -243,8 +295,12 @@ def _statement_activation_layer(
         unavailable = []
         constants = _constant_environment(module.constant_values)
         for record in records:
+            if record.is_initial and cycle != 0:
+                continue
             sample_cycle = cycle - 1 if record.is_sequential else cycle
-            if sample_cycle < 0 or not _known_binary(observed):
+            if sample_cycle < 0:
+                continue
+            if not _known_binary(observed):
                 unavailable.append(record.statement_id)
                 continue
             environment = dict(constants)
@@ -292,12 +348,54 @@ def _statement_activation_layer(
             if result is None or not _known_binary(str(result)):
                 unavailable.append(record.statement_id)
                 continue
-            if not _same_verilog_value(str(result), str(observed)):
+            evaluated, selected_observed = assigned_value(
+                record,
+                str(result),
+                str(observed),
+                module,
+                _clean_signal(resolution.local_signal),
+                constants,
+            )
+            if selected_observed is None or not _same_verilog_value(
+                evaluated, selected_observed
+            ):
                 continue
             active.append(record)
 
-        if unavailable or len(active) > 1:
-            status = "ambiguous" if len(active) > 1 else "unavailable"
+        effective = []
+        by_process: Dict[str, list[Any]] = {}
+        for record in active:
+            by_process.setdefault(
+                record.process_id or record.statement_id, []
+            ).append(record)
+        for process_records in by_process.values():
+            owners: Dict[int, Any] = {}
+            for record in process_records:
+                for bit in written_bits(
+                    record,
+                    module,
+                    _clean_signal(resolution.local_signal),
+                    constants,
+                ):
+                    owners[bit] = record
+            for record in process_records:
+                if record in owners.values() and record not in effective:
+                    effective.append(record)
+        process_by_bit: Dict[int, set[str]] = {}
+        for record in effective:
+            for bit in written_bits(
+                record,
+                module,
+                _clean_signal(resolution.local_signal),
+                constants,
+            ):
+                process_by_bit.setdefault(bit, set()).add(
+                    record.process_id or record.statement_id
+                )
+        ambiguous = any(len(owners) > 1 for owners in process_by_bit.values())
+
+        if unavailable or ambiguous:
+            status = "ambiguous" if ambiguous else "unavailable"
             diagnostics.append(
                 {
                     "code": f"statement_activation_{status}",
@@ -315,19 +413,20 @@ def _statement_activation_layer(
                 }
             )
             continue
-        if not active:
+        if not effective:
             continue
 
-        assignment = active[0]
-        statements = [
-            (assignment.statement_id, "active_statement_write")
-        ]
-        statements.extend(
-            (guard.statement_id, "active_guard")
-            for guard in module.guard_records
-            if assignment.statement_id in guard.enclosed_statement_ids
-        )
-        for statement_id, relation in statements:
+        statements = []
+        for assignment in effective:
+            statements.append(
+                (assignment.statement_id, "active_statement_write")
+            )
+            statements.extend(
+                (guard.statement_id, "active_guard")
+                for guard in module.guard_records
+                if assignment.statement_id in guard.enclosed_statement_ids
+            )
+        for statement_id, relation in sorted(set(statements)):
             statement = parser._statement_evidence[statement_id]
             artifact_id = artifact_by_path[str(Path(statement.file_path).resolve())]
             semantic_id = stable_id(

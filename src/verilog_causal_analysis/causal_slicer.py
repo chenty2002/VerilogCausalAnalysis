@@ -175,6 +175,12 @@ class ExpressionEvaluator:
                 if depth == 0 and ci < len(expr) - 1:
                     break  # Outer { closes before end — not a single concat
             else:
+                replication = self._parse_replication(expr[1:-1])
+                if replication:
+                    count_expr, value_expr = replication
+                    count = parse_binary_value(self._eval_expr(count_expr))
+                    value = self._eval_expr(value_expr)
+                    return value * count if value is not None and count is not None else None
                 parts = self._split_concat_parts(expr[1:-1])
                 if parts:
                     result_bits = []
@@ -274,6 +280,22 @@ class ExpressionEvaluator:
         if current:
             parts.append(''.join(current))
         return parts
+
+    @staticmethod
+    def _parse_replication(inner: str) -> Optional[Tuple[str, str]]:
+        """Return the count and value from the inside of ``{count{value}}``."""
+        depth = 0
+        for index, char in enumerate(inner):
+            if char in '([':
+                depth += 1
+            elif char in ')]':
+                depth -= 1
+            elif char == '{' and depth == 0:
+                count = inner[:index].strip()
+                if count and inner.endswith('}'):
+                    return count, inner[index + 1:-1]
+                return None
+        return None
     
     def _parse_ternary(self, expr: str) -> Optional[Tuple[str, str, str]]:
         """Parse ternary operator (cond ? then : else)."""
@@ -312,6 +334,10 @@ class ExpressionEvaluator:
                 matched = False
                 for op in sorted_ops:
                     if expr[i:i+len(op)] == op:
+                        if op in {'&', '|', '^'} and i and expr[i - 1] == '~':
+                            i += 1
+                            matched = True
+                            break
                         if _PRECEDENCE[op] <= lowest[0]:
                             lowest = (_PRECEDENCE[op], i, op)
                         i += len(op)  # Skip past operator to avoid substring matches
@@ -345,6 +371,25 @@ class ExpressionEvaluator:
         # Direct signal lookup
         if expr in self.signal_values:
             return self.signal_values[expr]
+
+        select = re.fullmatch(r'([A-Za-z_$][\w$]*)\[(.+)\]', expr)
+        if select and select.group(1) in self.signal_values:
+            value = self.signal_values[select.group(1)]
+            bounds = self._split_index_range(select.group(2))
+            indexes = []
+            for bound in bounds:
+                evaluated = self._eval_expr(bound)
+                index = parse_binary_value(evaluated)
+                if index is None or index >= len(value):
+                    return None
+                indexes.append(index)
+            if len(indexes) == 1:
+                return value[-indexes[0] - 1]
+            step = -1 if indexes[0] >= indexes[1] else 1
+            return ''.join(
+                value[-index - 1]
+                for index in range(indexes[0], indexes[1] + step, step)
+            )
         
         # Try partial match (for hierarchical signals)
         for sig, val in self.signal_values.items():
@@ -352,6 +397,18 @@ class ExpressionEvaluator:
                 return val
         
         return None
+
+    @staticmethod
+    def _split_index_range(expression: str) -> List[str]:
+        depth = 0
+        for index, char in enumerate(expression):
+            if char in '([{':
+                depth += 1
+            elif char in ')]}':
+                depth -= 1
+            elif char == ':' and depth == 0:
+                return [expression[:index], expression[index + 1:]]
+        return [expression]
     
     def _is_true(self, val: str) -> bool:
         """Check if a value is logically true (non-zero)."""
@@ -498,6 +555,13 @@ class CompiledExpression:
                 if depth == 0 and index < len(expr) - 1:
                     break
             else:
+                replication = parser._parse_replication(expr[1:-1])
+                if replication:
+                    return (
+                        "replication",
+                        cls._compile_expr(parser, replication[0]),
+                        cls._compile_expr(parser, replication[1]),
+                    )
                 parts = parser._split_concat_parts(expr[1:-1])
                 if parts:
                     return (
@@ -580,6 +644,15 @@ class CompiledExpression:
                 for child in node[1]
             ]
             return None if any(value is None for value in values) else "".join(values)
+        if kind == "replication":
+            count = cls._evaluate_node(node[1], evaluator)
+            value = cls._evaluate_node(node[2], evaluator)
+            parsed_count = parse_binary_value(count)
+            return (
+                value * parsed_count
+                if value is not None and parsed_count is not None
+                else None
+            )
         if kind == "ternary":
             condition = cls._evaluate_node(node[1], evaluator)
             if condition is None:

@@ -402,6 +402,10 @@ class AssignmentRecord:
     file_path: str
     line_start: int
     line_end: int
+    targets: Tuple[str, ...] = ()
+    target_expression: str = ""
+    process_id: str = ""
+    is_initial: bool = False
 
 
 @dataclass
@@ -552,19 +556,29 @@ class VerilogParser:
             end = start + max_lines
         return '\n'.join(lines[start:end])
 
-    def _assignment_line(self, file_path: str, target: str) -> int:
+    def _assignment_line(
+        self,
+        file_path: str,
+        target: str,
+        preferred_line: int = 0,
+    ) -> int:
         key = (file_path, target)
         lines = self._statement_line_hints.get(key)
         if lines is None:
             pattern = re.compile(
-                rf"\b{re.escape(target)}\s*(?:<=|=(?!=))"
+                rf"(?:\b{re.escape(target)}\s*(?:\[[^]]+\]\s*)*"
+                rf"|{{[^;=]*\b{re.escape(target)}\b[^;=]*}}\s*)"
+                rf"(?:<=|=(?!=))"
             )
             lines = [
                 index
                 for index, line in enumerate(self.file_lines[file_path], 1)
-                if pattern.search(line)
+                for _ in pattern.finditer(line)
             ]
             self._statement_line_hints[key] = lines
+        if preferred_line in lines:
+            lines.remove(preferred_line)
+            return preferred_line
         return lines.pop(0) if lines else 0
 
     def _port_binding_position(
@@ -588,7 +602,9 @@ class VerilogParser:
             ]
         )
         instance = re.search(
-            rf"\b{re.escape(child_module)}\s+{re.escape(instance_name)}\s*\(",
+            rf"\b{re.escape(child_module)}\s+"
+            rf"(?:#\s*\([^;]*?\)\s*)?"
+            rf"{re.escape(instance_name)}\s*\(",
             content[start:stop],
         )
         if instance is None:
@@ -596,12 +612,15 @@ class VerilogParser:
         end = content.find(";", start + instance.end(), stop)
         if end < 0:
             return 0, 0
+        instance_line = content.count(
+            "\n", 0, start + instance.start()
+        ) + 1
         binding = re.search(
             rf"\.\s*{re.escape(port_name)}\s*\(",
             content[start + instance.start() : end],
         )
         if binding is None:
-            return 0, 0
+            return instance_line, instance_line
         line = content.count(
             "\n", 0, start + instance.start() + binding.start()
         ) + 1
@@ -650,6 +669,16 @@ class VerilogParser:
             if node.fn == HdlOpType.INDEX and node.ops:
                 return self._get_signal_name(node.ops[0])
         return None
+
+    def _get_assignment_targets(self, node) -> List[str]:
+        if isinstance(node, HdlOp) and node.fn == HdlOpType.CONCAT:
+            return [
+                target
+                for item in node.ops
+                for target in self._get_assignment_targets(item)
+            ]
+        target = self._get_signal_name(node)
+        return [target] if target else []
 
     @staticmethod
     def _strip_width(signal_name: str) -> str:
@@ -855,8 +884,12 @@ class VerilogParser:
                 return f"({self._expr_to_string(ops[0], depth+1)} ? {self._expr_to_string(ops[1], depth+1)} : {self._expr_to_string(ops[2], depth+1)})"
             if node.fn == HdlOpType.INDEX and len(ops) >= 2:
                 return f"{self._expr_to_string(ops[0], depth+1)}[{self._expr_to_string(ops[1], depth+1)}]"
+            if node.fn == HdlOpType.DOWNTO and len(ops) == 2:
+                return f"{self._expr_to_string(ops[0], depth+1)}:{self._expr_to_string(ops[1], depth+1)}"
             if node.fn == HdlOpType.CONCAT:
                 return "{" + ", ".join(self._expr_to_string(op, depth+1) for op in ops) + "}"
+            if node.fn == HdlOpType.REPL_CONCAT and len(ops) == 2:
+                return "{" + self._expr_to_string(ops[0], depth+1) + "{" + self._expr_to_string(ops[1], depth+1) + "}}"
             if node.fn in _UNARY_OPS and ops:
                 return f"{fn_name}{self._expr_to_string(ops[0], depth+1)}"
             if len(ops) == 2:
@@ -892,156 +925,83 @@ class VerilogParser:
         """Process an assignment statement and extract dependencies."""
         condition_sources = (condition_sources or set()) - module.constants
         if isinstance(assign, HdlStmAssign):
-            target = self._get_signal_name(assign.dst)
-            if not target:
+            destination, source = assign.dst, assign.src
+            preferred_line, _ = self._get_position(assign)
+        elif isinstance(assign, HdlOp) and assign.fn == HdlOpType.ASSIGN:
+            if len(assign.ops) < 2:
                 return
-            
-            sources = self._extract_signals_from_expr(assign.src) - module.constants
-            expr_str = self._expr_to_string(assign.src)
-            
-            line_start, line_end = self._get_position(assign)
-            
-            dep_type = DependencyType.SEQUENTIAL if is_sequential else DependencyType.COMBINATIONAL
-            assignment_statement = StatementEvidence.create(
+            destination, source = assign.ops[:2]
+            preferred_line = 0
+        else:
+            return
+
+        targets = self._get_assignment_targets(destination)
+        sources = self._extract_signals_from_expr(source) - module.constants
+        expr_str = self._expr_to_string(source)
+        dep_type = (
+            DependencyType.SEQUENTIAL
+            if is_sequential
+            else DependencyType.COMBINATIONAL
+        )
+        if not targets:
+            return
+        statement_target = targets[0]
+        line_start = self._assignment_line(
+            file_path, statement_target, preferred_line
+        )
+        snippet = self._get_code_snippet(
+            file_path, line_start, line_start
+        )
+        statement = self._intern_statement(
+            StatementEvidence.create(
                 expression=expr_str,
                 file_path=file_path,
                 line_start=line_start,
-                line_end=line_end,
-                code_snippet=self._get_code_snippet(
-                    file_path, line_start, line_end
-                ),
+                line_end=line_start,
+                code_snippet=snippet,
                 condition=condition,
                 module_name=module.name,
-                target=target,
-                target_qualified=self._qualify_signal(module, target),
+                target=statement_target,
+                target_qualified=self._qualify_signal(
+                    module, statement_target
+                ),
             )
-            assignment_statement = self._intern_statement(
-                assignment_statement
+        )
+        module.assignment_records.append(
+            AssignmentRecord(
+                statement_target,
+                expr_str,
+                condition,
+                is_sequential,
+                statement.statement_id,
+                file_path,
+                line_start,
+                line_start,
+                tuple(targets),
+                self._expr_to_string(destination),
             )
-            module.assignment_records.append(
-                AssignmentRecord(
-                    target,
-                    expr_str,
-                    condition,
-                    is_sequential,
-                    assignment_statement.statement_id,
-                    file_path,
-                    line_start,
-                    line_end,
-                )
-            )
-            
-            for source in sorted(sources):
-                if source != target:  # Avoid self-loops
-                    dep = self._make_dependency(
-                        module=module,
-                        source=source,
+        )
+        for target in targets:
+            for dependency_source in sorted(
+                sources | condition_sources
+            ):
+                if dependency_source == target:
+                    continue
+                self._add_dependency(
+                    module,
+                    Dependency(
+                        source=dependency_source,
                         target=target,
                         dep_type=dep_type,
-                        expression=expr_str,
-                        file_path=file_path,
-                        line_start=line_start,
-                        line_end=line_end,
-                        code_snippet=self._get_code_snippet(file_path, line_start, line_end),
-                        condition=condition
-                    )
-                    self._add_dependency(module, dep)
-
-            for source in sorted(condition_sources - sources):
-                if source != target:
-                    dep = self._make_dependency(
-                        module=module,
-                        source=source,
-                        target=target,
-                        dep_type=dep_type,
-                        expression=expr_str,
-                        file_path=file_path,
-                        line_start=line_start,
-                        line_end=line_end,
-                        code_snippet=self._get_code_snippet(file_path, line_start, line_end),
-                        condition=condition
-                    )
-                    self._add_dependency(module, dep)
-        
-        elif isinstance(assign, HdlOp) and assign.fn == HdlOpType.ASSIGN:
-            # Blocking assignment as HdlOp
-            if len(assign.ops) >= 2:
-                target = self._get_signal_name(assign.ops[0])
-                if not target:
-                    return
-                
-                sources = (
-                    self._extract_signals_from_expr(assign.ops[1])
-                    - module.constants
-                )
-                expr_str = self._expr_to_string(assign.ops[1])
-                line_start = self._assignment_line(file_path, target)
-                
-                dep_type = DependencyType.SEQUENTIAL if is_sequential else DependencyType.COMBINATIONAL
-                assignment_statement = StatementEvidence.create(
-                    expression=expr_str,
-                    file_path=file_path,
-                    line_start=line_start,
-                    line_end=line_start,
-                    code_snippet=self._get_code_snippet(
-                        file_path, line_start, line_start
+                        source_qualified=self._qualify_signal(
+                            module, dependency_source
+                        ),
+                        target_qualified=self._qualify_signal(
+                            module, target
+                        ),
+                        statement=statement,
                     ),
-                    condition=condition,
-                    module_name=module.name,
-                    target=target,
-                    target_qualified=self._qualify_signal(module, target),
                 )
-                assignment_statement = self._intern_statement(
-                    assignment_statement
-                )
-                module.assignment_records.append(
-                    AssignmentRecord(
-                        target,
-                        expr_str,
-                        condition,
-                        is_sequential,
-                        assignment_statement.statement_id,
-                        file_path,
-                        line_start,
-                        line_start,
-                    )
-                )
-                
-                for source in sorted(sources):
-                    if source != target:
-                        dep = self._make_dependency(
-                            module=module,
-                            source=source,
-                            target=target,
-                            dep_type=dep_type,
-                            expression=expr_str,
-                            file_path=file_path,
-                            line_start=line_start,
-                            line_end=line_start,
-                            code_snippet=self._get_code_snippet(
-                                file_path, line_start, line_start
-                            ),
-                            condition=condition
-                        )
-                        self._add_dependency(module, dep)
-
-                for source in sorted(condition_sources - sources):
-                    if source != target:
-                        dep = self._make_dependency(
-                            module=module,
-                            source=source,
-                            target=target,
-                            dep_type=dep_type,
-                            expression=expr_str,
-                            file_path=file_path,
-                            line_start=line_start,
-                            line_end=line_start,
-                            code_snippet=self._get_code_snippet(
-                                file_path, line_start, line_start
-                            ),
-                            condition=condition
-                        )
-                        self._add_dependency(module, dep)
     
     @staticmethod
     def _join_conditions(*conditions: str) -> str:
@@ -1058,10 +1018,10 @@ class VerilogParser:
         before_line: int = 0,
     ) -> int:
         needle = re.sub(r"[\s()_]", "", condition)
+        needle = needle.replace("DOWNTO", ":")
         text = []
         lines = []
-        if line_start <= 0 or line_end <= 0:
-            line_start, line_end = 1, len(self.file_lines[file_path])
+        line_start, line_end = 1, len(self.file_lines[file_path])
         for line in range(
             max(1, line_start),
             min(len(self.file_lines[file_path]), line_end) + 1,
@@ -1078,10 +1038,12 @@ class VerilogParser:
             if needle and haystack.startswith(needle, index)
         ]
         matched_lines = sorted({lines[index] for index in positions})
+        preceding = [line for line in matched_lines if before_line and line <= before_line]
+        if preceding:
+            return preceding[-1]
         if len(matched_lines) == 1:
             return matched_lines[0]
-        preceding = [line for line in matched_lines if before_line and line < before_line]
-        return preceding[-1] if preceding else 0
+        return 0
 
     def _record_guard(
         self,
@@ -1231,8 +1193,15 @@ class VerilogParser:
             for case_val, case_body in getattr(stmt, 'cases', ()) or ():
                 case_cond = self._expr_to_string(case_val)
                 item_cond = f"({case_expr_str} == {case_cond})"
+                prior_cond = (
+                    "!(" + " || ".join(case_conditions) + ")"
+                    if case_conditions
+                    else ""
+                )
                 case_conditions.append(item_cond)
-                full_path = self._join_conditions(condition, item_cond)
+                full_path = self._join_conditions(
+                    condition, prior_cond, item_cond
+                )
                 branch_start = len(module.assignment_records)
                 self._process_statement(
                     case_body, module, file_path, is_sequential,
@@ -1389,7 +1358,7 @@ class VerilogParser:
                 and getattr(row, "is_const", False)
             }
         )
-        for body_obj in obj.objs:
+        for body_index, body_obj in enumerate(obj.objs):
             if isinstance(body_obj, HdlIdDef):
                 if getattr(body_obj, "is_const", False):
                     continue
@@ -1444,6 +1413,9 @@ class VerilogParser:
                             file_path,
                             sig_line,
                             sig_line,
+                            (sig_name,),
+                            sig_name,
+                            f"body:{body_index}",
                         )
                     )
                     for source in sorted(sources):
@@ -1464,19 +1436,28 @@ class VerilogParser:
                                 ),
                             )
             elif isinstance(body_obj, HdlStmProcess):
+                assignment_start = len(module.assignment_records)
                 self._process_statement(
                     body_obj.body,
                     module,
                     file_path,
                     self._is_sequential_process(body_obj),
                 )
+                for row in module.assignment_records[assignment_start:]:
+                    row.process_id = f"body:{body_index}"
+                    row.is_initial = not getattr(
+                        body_obj, "sensitivity", None
+                    )
             elif isinstance(body_obj, HdlStmAssign):
+                assignment_start = len(module.assignment_records)
                 self._process_assignment(
                     body_obj,
                     module,
                     file_path,
                     is_sequential=False,
                 )
+                for row in module.assignment_records[assignment_start:]:
+                    row.process_id = f"body:{body_index}"
             elif isinstance(body_obj, HdlCompInst):
                 inst_name = str(
                     getattr(body_obj.name, "val", body_obj.name)
@@ -1771,6 +1752,10 @@ class VerilogParser:
                             "artifact_id": artifact_id(row.file_path),
                             "line_start": row.line_start,
                             "line_end": row.line_end,
+                            "targets": list(row.targets),
+                            "target_expression": row.target_expression,
+                            "process_id": row.process_id,
+                            "is_initial": row.is_initial,
                         }
                         for row in sorted(
                             module.assignment_records,
@@ -1926,6 +1911,23 @@ class VerilogParser:
                         ),
                         line_start=int(assignment_row["line_start"]),
                         line_end=int(assignment_row["line_end"]),
+                        targets=tuple(
+                            str(item)
+                            for item in assignment_row.get(
+                                "targets", [assignment_row["target"]]
+                            )
+                        ),
+                        target_expression=str(
+                            assignment_row.get(
+                                "target_expression", assignment_row["target"]
+                            )
+                        ),
+                        process_id=str(
+                            assignment_row.get("process_id", "")
+                        ),
+                        is_initial=bool(
+                            assignment_row.get("is_initial", False)
+                        ),
                     )
                 )
             for guard_row in module_row.get("guard_records", []):
